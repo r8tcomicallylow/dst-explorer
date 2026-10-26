@@ -1,0 +1,44 @@
+[package]
+name = "doujin-explorer"
+version = "1.0.0"
+edition = "2021"
+description = "A fast, minimal desktop browser and download manager for DoujinStyle.com"
+license = "MIT"
+repository = "https://github.com/yourusername/doujin-explorer"
+homepage = "https://github.com/yourusername/doujin-explorer"
+readme = "README.md"
+keywords = ["doujin", "music", "downloader", "doujinstyle", "gui", "egui"]
+categories = ["command-line-utilities", "development-tools"]
+
+[badges]
+maintenance = { status = "actively-developed" }
+
+[dependencies]
+eframe = { version = "0.29.1", default-features = false, features = ["default_fonts", "glow"] }
+egui = "0.29.1"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "native-tls", "gzip", "brotli", "cookies"] }
+scraper = "0.23"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+image = { version = "0.25.5", default-features = false, features = ["jpeg", "png", "webp"] }
+zip = { version = "2.2.1", default-features = false, features = ["deflate"] }
+dirs = "5"
+percent-encoding = "2"
+crossbeam-channel = "0.5"
+webbrowser = "1"
+rfd = "0.15"
+notify-rust = "4.18"
+tray-icon = { version = "0.26", default-features = false, features = ["ksni"] }
+chrono = "0.4"
+env_logger = "0.11"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

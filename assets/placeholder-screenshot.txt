@@ -1,0 +1,8 @@
+Place screenshots here:
+- screenshot.png (main)
+- discover.png
+- search.png
+- detail.png
+- downloads.png
+
+Recommended size: 1200x760 or similar 16:9 aspect ratio.
