@@ -250,6 +250,8 @@ pub struct App {
     focus_search: bool,
     search_save_draft: Option<String>,
     library_query: String,
+    library_format_filter: Option<String>,
+    library_year_filter: Option<u16>,
     watch_filter: WatchFilter,
     folder_draft: Option<String>,
     folder_rename: Option<(String, String)>,
@@ -321,6 +323,8 @@ impl App {
             focus_search: false,
             search_save_draft: None,
             library_query: String::new(),
+            library_format_filter: None,
+            library_year_filter: None,
             watch_filter: WatchFilter::All,
             folder_draft: None,
             folder_rename: None,
@@ -1090,6 +1094,45 @@ impl App {
             View::Watchlist => self.watch_albums(),
             View::Downloads | View::Library | View::Settings => Vec::new(),
         }
+    }
+
+    fn get_library_formats(&self) -> Vec<String> {
+        let mut formats: Vec<String> = self
+            .persisted
+            .library
+            .iter()
+            .filter_map(|e| {
+                let fmt = e.album.format.trim();
+                if fmt.is_empty() {
+                    None
+                } else {
+                    Some(fmt.to_string())
+                }
+            })
+            .collect();
+        formats.sort();
+        formats.dedup();
+        formats
+    }
+
+    fn get_library_years(&self) -> Vec<u16> {
+        let mut years: Vec<u16> = self
+            .persisted
+            .library
+            .iter()
+            .filter_map(|e| {
+                let year = e.album.year;
+                if year == 0 {
+                    None
+                } else {
+                    Some(year)
+                }
+            })
+            .collect();
+        years.sort();
+        years.dedup();
+        years.reverse(); // newest first
+        years
     }
 
     fn find_album(&self, id: u64) -> Option<Album> {
@@ -2333,7 +2376,76 @@ impl App {
                 store::open_path(&dir);
             }
         });
-        ui.add_space(12.0);
+        ui.add_space(8.0);
+
+        // Filter toolbar
+        ui.horizontal(|ui| {
+            // Format filter
+            let formats = self.get_library_formats();
+            let format_label = self.library_format_filter
+                .as_ref()
+                .map(|f| f.as_str())
+                .unwrap_or("All formats");
+            egui::ComboBox::from_id_salt("library_format_filter")
+                .selected_text(format_label)
+                .width(140.0)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.library_format_filter, None, "All formats");
+                    for fmt in &formats {
+                        ui.selectable_value(&mut self.library_format_filter, Some(fmt.clone()), fmt);
+                    }
+                });
+            
+            ui.add_space(8.0);
+            
+            // Year filter
+            let years = self.get_library_years();
+            let year_label = self.library_year_filter
+                .map(|y| y.to_string())
+                .unwrap_or_else(|| "All years".to_string());
+            egui::ComboBox::from_id_salt("library_year_filter")
+                .selected_text(year_label)
+                .width(110.0)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.library_year_filter, None, "All years");
+                    for year in &years {
+                        ui.selectable_value(&mut self.library_year_filter, Some(*year), year.to_string());
+                    }
+                });
+
+            ui.add_space(16.0);
+            
+            // Search box
+            let (rect, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
+            theme::paint_icon(ui.painter(), rect, Icon::Search, DIM, 1.4);
+            let width = (ui.available_width() - 36.0).max(60.0);
+            ui.add_sized(
+                [width, 24.0],
+                TextEdit::singleline(&mut self.library_query)
+                    .id(Id::new("library-filter"))
+                    .frame(false)
+                    .hint_text("Filter by title, artist or folder…")
+                    .font(FontId::proportional(13.0)),
+            );
+            if !self.library_query.is_empty()
+                && theme::small_button(ui, "Clear", DIM).clicked()
+            {
+                self.library_query.clear();
+            }
+            
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                // Clear all filters
+                let has_filters = self.library_format_filter.is_some() 
+                    || self.library_year_filter.is_some() 
+                    || !self.library_query.is_empty();
+                if has_filters && theme::small_button(ui, "Clear all", DIM).clicked() {
+                    self.library_format_filter = None;
+                    self.library_year_filter = None;
+                    self.library_query.clear();
+                }
+            });
+        });
+        ui.add_space(10.0);
 
         if count == 0 {
             let mut browse = false;
@@ -2351,44 +2463,29 @@ impl App {
             return;
         }
 
-        Frame::none()
-            .fill(PANEL)
-            .stroke(Stroke::new(1.0_f32, BORDER_SOFT))
-            .rounding(Rounding::same(11.0))
-            .inner_margin(Margin::symmetric(12.0, 8.0))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    let (rect, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
-                    theme::paint_icon(ui.painter(), rect, Icon::Search, DIM, 1.4);
-                    let width = (ui.available_width() - 36.0).max(60.0);
-                    ui.add_sized(
-                        [width, 24.0],
-                        TextEdit::singleline(&mut self.library_query)
-                            .id(Id::new("library-filter"))
-                            .frame(false)
-                            .hint_text("Filter by title, artist or folder…")
-                            .font(FontId::proportional(13.0)),
-                    );
-                    if !self.library_query.is_empty()
-                        && theme::small_button(ui, "Clear", DIM).clicked()
-                    {
-                        self.library_query.clear();
-                    }
-                });
-            });
-        ui.add_space(10.0);
-
         let query = self.library_query.trim().to_lowercase();
+        let format_filter = &self.library_format_filter;
+        let year_filter = self.library_year_filter;
         let visible: Vec<usize> = self
             .persisted
             .library
             .iter()
             .enumerate()
             .filter(|(_, entry)| {
-                query.is_empty()
+                let matches_query = query.is_empty()
                     || entry.album.title.to_lowercase().contains(&query)
                     || entry.album.artist.to_lowercase().contains(&query)
-                    || entry.path.to_string_lossy().to_lowercase().contains(&query)
+                    || entry.path.to_string_lossy().to_lowercase().contains(&query);
+                
+                let matches_format = format_filter.as_ref().map_or(true, |f| {
+                    entry.album.format.trim().eq_ignore_ascii_case(f)
+                });
+                
+                let matches_year = year_filter.map_or(true, |y| {
+                    entry.album.year == y
+                });
+                
+                matches_query && matches_format && matches_year
             })
             .map(|(index, _)| index)
             .collect();
