@@ -1,6 +1,6 @@
 [package]
 name = "dst-explorer"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 description = "A fast, minimal desktop browser and download manager for DoujinStyle.com"
 license = "MIT"

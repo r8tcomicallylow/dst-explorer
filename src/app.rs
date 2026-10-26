@@ -1975,7 +1975,10 @@ impl App {
                 } else {
                     format!("Results for “{}”", self.search.query.trim())
                 };
-                ui.label(egui::RichText::new(title).size(14.0).strong().color(TEXT));
+                ui.add(
+                    egui::Label::new(egui::RichText::new(title).size(14.0).strong().color(TEXT))
+                        .truncate(),
+                );
                 ui.label(
                     egui::RichText::new(format!(
                         "{} · {}",
@@ -3469,11 +3472,14 @@ impl App {
             .title_bar(false)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new(&album.title)
-                            .size(13.0)
-                            .strong()
-                            .color(TEXT),
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(&album.title)
+                                .size(13.0)
+                                .strong()
+                                .color(TEXT),
+                        )
+                        .truncate(),
                     );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if theme::icon_button(ui, Icon::Close, 28.0, MUTED).clicked() {
@@ -4038,12 +4044,15 @@ fn view_heading(ui: &mut Ui, eyebrow: &str, title: &str, subtitle: &str) {
                 .color(accent()),
         );
         ui.add_space(3.0);
-        ui.label(
-            egui::RichText::new(title)
-                .font(FontId::new(27.0, FontFamily::Proportional))
-                .strong()
-                .color(TEXT),
-        );
+        ui.add(
+                egui::Label::new(
+                    egui::RichText::new(title)
+                        .font(FontId::new(27.0, FontFamily::Proportional))
+                        .strong()
+                        .color(TEXT),
+                )
+                .wrap(),
+            );
         if !subtitle.is_empty() {
             ui.label(egui::RichText::new(subtitle).size(12.0).color(MUTED));
         }
@@ -4089,11 +4098,15 @@ fn draw_empty(
                 1.7,
             );
             ui.add_space(14.0);
-            ui.label(
-                egui::RichText::new(title)
-                    .font(FontId::new(19.0, FontFamily::Proportional))
-                    .strong()
-                    .color(TEXT),
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(title)
+                        .font(FontId::new(19.0, FontFamily::Proportional))
+                        .strong()
+                        .color(TEXT),
+                )
+                .wrap()
+                .halign(Align::Center),
             );
             ui.add_space(5.0);
             ui.add(
@@ -4317,9 +4330,12 @@ impl SidePanelLeft {
                         return;
                     }
                     ui.label(
-                        egui::RichText::new("v0.1 · unofficial")
-                            .size(9.5)
-                            .color(DIM),
+                        egui::RichText::new(format!(
+                            "v{} · unofficial desktop client",
+                            env!("CARGO_PKG_VERSION")
+                        ))
+                        .size(9.5)
+                        .color(DIM),
                     );
                     ui.add_space(8.0);
                     if nav_row(
@@ -5229,18 +5245,24 @@ fn draw_detail(
             }
             ui.add_space(14.0);
 
-            ui.label(
-                egui::RichText::new(&album.title)
-                    .font(FontId::new(21.0, FontFamily::Proportional))
-                    .strong()
-                    .color(TEXT),
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(&album.title)
+                        .font(FontId::new(21.0, FontFamily::Proportional))
+                        .strong()
+                        .color(TEXT),
+                )
+                .wrap(),
             );
             ui.add_space(3.0);
             if !album.artist.trim().is_empty() {
-                ui.label(
-                    egui::RichText::new(album.artist.trim())
-                        .size(12.2)
-                        .color(MUTED),
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(album.artist.trim())
+                            .size(12.2)
+                            .color(MUTED),
+                    )
+                    .wrap(),
                 );
             }
             ui.add_space(9.0);
