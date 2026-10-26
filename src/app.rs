@@ -280,6 +280,8 @@ impl App {
             settings.max_concurrent,
             settings.download_dir.clone(),
             settings.auto_extract,
+            settings.auto_retry,
+            settings.max_retries,
         );
         let mut app = Self {
             persisted,
@@ -2767,6 +2769,33 @@ impl App {
                     ui.add_space(4.0);
                     if ui
                         .checkbox(
+                            &mut self.persisted.settings.auto_retry,
+                            egui::RichText::new("Auto-retry failed downloads (temporary errors)")
+                                .size(12.5),
+                        )
+                        .changed()
+                    {
+                        changed = true;
+                    }
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("Max retries")
+                                .size(12.0)
+                                .color(MUTED),
+                        );
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.add(
+                                egui::DragValue::new(&mut self.persisted.settings.max_retries)
+                                    .range(0..=10)
+                                    .speed(0.5)
+                                    .suffix(" attempts"),
+                            );
+                        });
+                    });
+                    ui.add_space(4.0);
+                    if ui
+                        .checkbox(
                             &mut self.persisted.settings.show_new_badges,
                             egui::RichText::new("Show NEW badges for unseen releases")
                                 .size(12.5),
@@ -3146,6 +3175,8 @@ impl App {
                 self.persisted.settings.max_concurrent,
                 self.persisted.settings.download_dir.clone(),
                 self.persisted.settings.auto_extract,
+                self.persisted.settings.auto_retry,
+                self.persisted.settings.max_retries,
             );
         }
     }
@@ -3567,6 +3598,8 @@ impl eframe::App for App {
             self.persisted.settings.max_concurrent,
             self.persisted.settings.download_dir.clone(),
             self.persisted.settings.auto_extract,
+            self.persisted.settings.auto_retry,
+            self.persisted.settings.max_retries,
         );
         let notices = self.downloads.poll();
         self.handle_download_notices(notices);
