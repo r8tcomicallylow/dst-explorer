@@ -404,7 +404,7 @@ impl App {
         if !self.tray_hint_shown {
             self.tray_hint_shown = true;
             self.desktop_notify(
-                "Doujin Explorer is still running",
+                "DST-Explorer is still running",
                 "Use the tray icon to reopen the window or quit.",
             );
         }
@@ -415,7 +415,7 @@ impl App {
             return;
         }
         let _ = notify_rust::Notification::new()
-            .appname("Doujin Explorer")
+            .appname("DST-Explorer")
             .summary(summary)
             .body(body)
             .timeout(notify_rust::Timeout::Milliseconds(5000))
@@ -3069,7 +3069,7 @@ impl App {
                 ui.add_space(14.0);
                 settings_card(ui, "About", |ui| {
                     ui.label(
-                        egui::RichText::new("Doujin Explorer")
+                        egui::RichText::new("DST-Explorer")
                             .size(15.0)
                             .strong()
                             .color(TEXT),

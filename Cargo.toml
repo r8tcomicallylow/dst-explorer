@@ -1,11 +1,11 @@
 [package]
-name = "doujin-explorer"
+name = "dst-explorer"
 version = "1.0.0"
 edition = "2021"
 description = "A fast, minimal desktop browser and download manager for DoujinStyle.com"
 license = "MIT"
-repository = "https://github.com/yourusername/doujin-explorer"
-homepage = "https://github.com/yourusername/doujin-explorer"
+repository = "https://github.com/yourusername/dst-explorer"
+homepage = "https://github.com/yourusername/dst-explorer"
 readme = "README.md"
 keywords = ["doujin", "music", "downloader", "doujinstyle", "gui", "egui"]
 categories = ["command-line-utilities", "development-tools"]

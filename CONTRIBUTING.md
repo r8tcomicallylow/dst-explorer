@@ -1,4 +1,4 @@
-# Contributing to Doujin Explorer
+# Contributing to DST-Explorer
 
 Thank you for considering contributing! This is a personal project, but contributions are welcome.
 
@@ -6,15 +6,15 @@ Thank you for considering contributing! This is a personal project, but contribu
 
 ```bash
 # Clone and build
-git clone https://github.com/yourusername/doujin-explorer
-cd doujin-explorer
+git clone https://github.com/yourusername/dst-explorer
+cd dst-explorer
 cargo run
 ```
 
 Requirements:
 - Rust 1.75+ (stable)
 - Windows/Linux/macOS with OpenGL
-- On Linux: `libglib2.0-dev libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libssl-dev pkg-config`
+- On Linux: `libglib2.0-dev libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libssl-dev pkg-config build-essential curl`
 
 ## Running Tests
 
@@ -46,7 +46,7 @@ cargo test -- --ignored --nocapture --test-threads=1
 Use GitHub Issues with:
 - OS and Rust version
 - Steps to reproduce
-- Logs (set `DOUJIN_EXPLORER_LOG=1`)
+- Logs (set `DST_EXPLORER_LOG=1`)
 - Screenshot if UI-related
 
 ## Architecture Overview

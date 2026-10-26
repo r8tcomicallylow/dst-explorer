@@ -24,7 +24,7 @@ All notable changes to this project will be documented in this format.
 - **foobar2000 integration** - send albums to foobar2000 via `/add`
 - **Mass download by tag/artist** from context menus
 - **Download all results** button in search
-- Optional logging via `DOUJIN_EXPLORER_LOG=1`
+- Optional logging via `DST_EXPLORER_LOG=1`
 
 ### Fixed
 - Cover art preview window close button duplication

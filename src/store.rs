@@ -6,22 +6,22 @@ use crate::models::{Persisted, STATE_VERSION};
 use crate::persist;
 
 pub fn data_dir() -> PathBuf {
-    if let Some(path) = std::env::var_os("DOUJIN_EXPLORER_DATA_DIR") {
+    if let Some(path) = std::env::var_os("DST_EXPLORER_DATA_DIR") {
         return PathBuf::from(path);
     }
     dirs::data_dir()
         .or_else(|| dirs::config_dir())
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("DoujinExplorer")
+        .join("DST-Explorer")
 }
 
 pub fn cache_dir() -> PathBuf {
-    if let Some(path) = std::env::var_os("DOUJIN_EXPLORER_CACHE_DIR") {
+    if let Some(path) = std::env::var_os("DST_EXPLORER_CACHE_DIR") {
         return PathBuf::from(path);
     }
     dirs::cache_dir()
         .unwrap_or_else(data_dir)
-        .join("DoujinExplorer")
+        .join("DST-Explorer")
 }
 
 pub fn config_path() -> PathBuf {
