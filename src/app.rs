@@ -862,6 +862,101 @@ impl App {
         }
     }
 
+    fn export_all(&mut self) {
+        use serde_json::json;
+        
+        let export = json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "settings": self.persisted.settings,
+            "watchlist": self.persisted.watchlist,
+            "watch_folders": self.persisted.watch_folders,
+            "watch_meta": self.persisted.watch_meta,
+            "library": self.persisted.library,
+            "save_rules": self.persisted.save_rules,
+        });
+        
+        if let Some(path) = rfd::FileDialog::new()
+            .set_title("Export DST-Explorer data")
+            .add_filter("JSON", &["json"])
+            .set_file_name(&format!("dst-explorer-export-{}.json", chrono::Local::now().format("%Y%m%d")))
+            .save_file()
+        {
+            match std::fs::write(&path, serde_json::to_string_pretty(&export).unwrap()) {
+                Ok(_) => self.toast(format!("Exported to {}", path.display()), ToastTone::Success),
+                Err(e) => self.toast(format!("Export failed: {}", e), ToastTone::Error),
+            }
+        }
+    }
+
+    fn import_all(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .set_title("Import DST-Explorer data")
+            .add_filter("JSON", &["json"])
+            .pick_file()
+        {
+            match std::fs::read_to_string(&path) {
+                Ok(content) => {
+                    match serde_json::from_str::<serde_json::Value>(&content) {
+                        Ok(import) => {
+                            let mut imported_something = false;
+                            
+                            if let Some(settings) = import.get("settings") {
+                                if let Ok(s) = serde_json::from_value::<crate::models::Settings>(settings.clone()) {
+                                    self.persisted.settings = s;
+                                    imported_something = true;
+                                }
+                            }
+                            
+                            if let Some(watchlist) = import.get("watchlist") {
+                                if let Ok(w) = serde_json::from_value::<Vec<crate::models::Album>>(watchlist.clone()) {
+                                    self.persisted.watchlist = w;
+                                    imported_something = true;
+                                }
+                            }
+                            
+                            if let Some(watch_folders) = import.get("watch_folders") {
+                                if let Ok(w) = serde_json::from_value::<Vec<String>>(watch_folders.clone()) {
+                                    self.persisted.watch_folders = w;
+                                    imported_something = true;
+                                }
+                            }
+                            
+                            if let Some(watch_meta) = import.get("watch_meta") {
+                                if let Ok(w) = serde_json::from_value::<std::collections::HashMap<u64, crate::models::WatchMeta>>(watch_meta.clone()) {
+                                    self.persisted.watch_meta = w;
+                                    imported_something = true;
+                                }
+                            }
+                            
+                            if let Some(library) = import.get("library") {
+                                if let Ok(l) = serde_json::from_value::<Vec<crate::models::LibraryEntry>>(library.clone()) {
+                                    self.persisted.library = l;
+                                    imported_something = true;
+                                }
+                            }
+                            
+                            if let Some(save_rules) = import.get("save_rules") {
+                                if let Ok(r) = serde_json::from_value::<Vec<crate::models::SaveRule>>(save_rules.clone()) {
+                                    self.persisted.save_rules = r;
+                                    imported_something = true;
+                                }
+                            }
+                            
+                            if imported_something {
+                                self.dirty = true;
+                                self.toast(format!("Imported from {}", path.display()), ToastTone::Success);
+                            } else {
+                                self.toast("Import failed: no valid data found", ToastTone::Error);
+                            }
+                        }
+                        Err(e) => self.toast(format!("Import failed: {}", e), ToastTone::Error),
+                    }
+                }
+                Err(e) => self.toast(format!("Import failed: {}", e), ToastTone::Error),
+            }
+        }
+    }
+
     fn queue_download(&mut self, album: Album) {
         let title = album.title.clone();
         if self.persisted.in_library(album.id) {
@@ -3096,7 +3191,25 @@ impl App {
                         });
                     });
                 });
-
+                
+                ui.add_space(14.0);
+                settings_card(ui, "Import / Export", |ui| {
+                    ui.horizontal(|ui| {
+                        if theme::secondary_button(ui, "Export all").clicked() {
+                            self.export_all();
+                        }
+                        if theme::secondary_button(ui, "Import…").clicked() {
+                            self.import_all();
+                        }
+                    });
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new("Exports/imports settings, watchlist, library, and auto-save rules as JSON.")
+                            .size(10.5)
+                            .color(DIM),
+                    );
+                });
+                
                 ui.add_space(14.0);
                 settings_card(ui, "About", |ui| {
                     ui.label(
