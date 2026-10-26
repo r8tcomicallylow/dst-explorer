@@ -33,6 +33,10 @@ pub enum DownloadState {
     Failed,
     Cancelled,
     Manual,
+    Retrying {
+        attempt: usize,
+        max_retries: usize,
+    },
 }
 
 impl DownloadState {
@@ -47,13 +51,24 @@ impl DownloadState {
             Self::Failed => "Failed",
             Self::Cancelled => "Cancelled",
             Self::Manual => "Needs browser",
+            Self::Retrying { attempt, max_retries } => {
+                if attempt == max_retries {
+                    "Retrying (final attempt)"
+                } else {
+                    "Retrying…"
+                }
+            }
         }
     }
 
     pub fn is_active(self) -> bool {
         matches!(
             self,
-            Self::Queued | Self::Resolving | Self::Downloading | Self::Extracting
+            Self::Queued
+                | Self::Resolving
+                | Self::Downloading
+                | Self::Extracting
+                | Self::Retrying { .. }
         )
     }
 
@@ -193,6 +208,8 @@ pub struct DownloadManager {
     max_concurrent: usize,
     download_dir: PathBuf,
     auto_extract: bool,
+    auto_retry: bool,
+    max_retries: usize,
     /// Tasks whose worker is being stopped so they can be resumed later. The
     /// worker sends `Cancelled`; until then we must not let its state updates
     /// overwrite the paused state.
@@ -202,7 +219,13 @@ pub struct DownloadManager {
 }
 
 impl DownloadManager {
-    pub fn new(max_concurrent: usize, download_dir: PathBuf, auto_extract: bool) -> Self {
+    pub fn new(
+        max_concurrent: usize,
+        download_dir: PathBuf,
+        auto_extract: bool,
+        auto_retry: bool,
+        max_retries: usize,
+    ) -> Self {
         let (tx, rx) = unbounded();
         let mut manager = Self {
             tasks: Vec::new(),
@@ -214,6 +237,8 @@ impl DownloadManager {
             max_concurrent: max_concurrent.max(1),
             download_dir,
             auto_extract,
+            auto_retry,
+            max_retries,
             pause_requested: HashSet::new(),
             restored_paused: 0,
         };
@@ -289,10 +314,19 @@ impl DownloadManager {
         }
     }
 
-    pub fn configure(&mut self, max_concurrent: usize, download_dir: PathBuf, auto_extract: bool) {
+    pub fn configure(
+        &mut self,
+        max_concurrent: usize,
+        download_dir: PathBuf,
+        auto_extract: bool,
+        auto_retry: bool,
+        max_retries: usize,
+    ) {
         self.max_concurrent = max_concurrent.max(1);
         self.download_dir = download_dir;
         self.auto_extract = auto_extract;
+        self.auto_retry = auto_retry;
+        self.max_retries = max_retries;
         self.dispatch();
     }
 
@@ -654,9 +688,11 @@ impl DownloadManager {
             let tx = self.tx.clone();
             let dir = self.download_dir.clone();
             let auto_extract = self.auto_extract;
+            let auto_retry = self.auto_retry;
+            let max_retries = self.max_retries;
             let _ = thread::Builder::new()
                 .name(format!("download-{id}"))
-                .spawn(move || run_download(id, album, progress, dir, auto_extract, tx));
+                .spawn(move || run_download(id, album, progress, dir, auto_extract, auto_retry, max_retries, tx));
         }
         if started {
             self.persist();
@@ -670,97 +706,156 @@ fn run_download(
     progress: Arc<Progress>,
     download_dir: PathBuf,
     auto_extract: bool,
+    auto_retry: bool,
+    max_retries: usize,
     tx: Sender<DlEvent>,
 ) {
-    if progress.is_cancelled() {
-        let _ = tx.send(DlEvent::Cancelled { id });
-        return;
-    }
-    let _ = tx.send(DlEvent::State {
-        id,
-        state: DownloadState::Resolving,
-    });
+    let mut attempt = 0;
+    let base_delay = Duration::from_secs(2);
+    let max_delay = Duration::from_secs(30);
 
-    let resolution = api::resolve_download(album.id);
-    if progress.is_cancelled() {
-        let _ = tx.send(DlEvent::Cancelled { id });
-        return;
-    }
-
-    let direct = match resolution {
-        Ok(Resolution::Direct(link)) => link,
-        Ok(Resolution::Manual { url, reason }) => {
-            let _ = tx.send(DlEvent::Manual { id, url, reason });
-            return;
-        }
-        Err(error) => {
-            let _ = tx.send(DlEvent::Failed { id, error });
-            return;
-        }
-    };
-
-    let _ = tx.send(DlEvent::State {
-        id,
-        state: DownloadState::Downloading,
-    });
-
-    let client = match Client::builder()
-        .user_agent(UA)
-        .connect_timeout(Duration::from_secs(20))
-        .redirect(Policy::limited(10))
-        .build()
-    {
-        Ok(client) => client,
-        Err(err) => {
-            let _ = tx.send(DlEvent::Failed {
-                id,
-                error: format!("Could not start HTTP client: {err}"),
-            });
-            return;
-        }
-    };
-
-    let downloaded = match download_file(
-        &client,
-        &direct.url,
-        &direct.headers,
-        &album,
-        &download_dir,
-        &progress,
-    ) {
-        Ok(path) => path,
-        Err(DownloadError::Cancelled) => {
+    loop {
+        if progress.is_cancelled() {
             let _ = tx.send(DlEvent::Cancelled { id });
             return;
         }
-        Err(DownloadError::Failed(error)) => {
-            let _ = tx.send(DlEvent::Failed { id, error });
-            return;
-        }
-    };
 
-    let mut extracted = None;
-    let mut warning = None;
-    if auto_extract && is_zip(&downloaded) {
+        if attempt > 0 {
+            let delay = base_delay
+                .mul_f32(2.0_f32.powi(attempt as i32 - 1))
+                .min(max_delay);
+            let _ = tx.send(DlEvent::State {
+                id,
+                state: DownloadState::Retrying { attempt, max_retries },
+            });
+            std::thread::sleep(delay);
+        }
+
         let _ = tx.send(DlEvent::State {
             id,
-            state: DownloadState::Extracting,
+            state: if attempt == 0 {
+                DownloadState::Resolving
+            } else {
+                DownloadState::Downloading
+            },
         });
-        match extract_zip(&downloaded) {
-            Ok(folder) => extracted = Some(folder),
-            Err(error) => warning = Some(format!("Downloaded, but could not extract: {error}")),
-        }
-    }
 
-    // The file is already finalized at this point. Cancelling here would lose
-    // that fact and make a resumed task download the same archive again, so the
-    // completed transfer always wins the race.
-    let _ = tx.send(DlEvent::Completed {
-        id,
-        path: downloaded,
-        extracted,
-        warning,
-    });
+        let resolution = api::resolve_download(album.id);
+        if progress.is_cancelled() {
+            let _ = tx.send(DlEvent::Cancelled { id });
+            return;
+        }
+
+        let direct = match resolution {
+            Ok(Resolution::Direct(link)) => link,
+            Ok(Resolution::Manual { url, reason }) => {
+                let _ = tx.send(DlEvent::Manual { id, url, reason });
+                return;
+            }
+            Err(error) => {
+                if should_retry(&error, auto_retry, attempt, max_retries) {
+                    attempt += 1;
+                    continue;
+                }
+                let _ = tx.send(DlEvent::Failed { id, error });
+                return;
+            }
+        };
+
+        let _ = tx.send(DlEvent::State {
+            id,
+            state: DownloadState::Downloading,
+        });
+
+        let client = match Client::builder()
+            .user_agent(UA)
+            .connect_timeout(Duration::from_secs(20))
+            .redirect(Policy::limited(10))
+            .build()
+        {
+            Ok(client) => client,
+            Err(err) => {
+                let error = format!("Could not start HTTP client: {err}");
+                if should_retry(&error, auto_retry, attempt, max_retries) {
+                    attempt += 1;
+                    continue;
+                }
+                let _ = tx.send(DlEvent::Failed { id, error });
+                return;
+            }
+        };
+
+        let downloaded = match download_file(
+            &client,
+            &direct.url,
+            &direct.headers,
+            &album,
+            &download_dir,
+            &progress,
+        ) {
+            Ok(path) => path,
+            Err(DownloadError::Cancelled) => {
+                let _ = tx.send(DlEvent::Cancelled { id });
+                return;
+            }
+            Err(DownloadError::Failed(error)) => {
+                if should_retry(&error, auto_retry, attempt, max_retries) {
+                    attempt += 1;
+                    continue;
+                }
+                let _ = tx.send(DlEvent::Failed { id, error });
+                return;
+            }
+        };
+
+        let mut extracted = None;
+        let mut warning = None;
+        if auto_extract && is_zip(&downloaded) {
+            let _ = tx.send(DlEvent::State {
+                id,
+                state: DownloadState::Extracting,
+            });
+            match extract_zip(&downloaded) {
+                Ok(folder) => extracted = Some(folder),
+                Err(error) => warning = Some(format!("Downloaded, but could not extract: {error}")),
+            }
+        }
+
+        let _ = tx.send(DlEvent::Completed {
+            id,
+            path: downloaded,
+            extracted,
+            warning,
+        });
+        return;
+    }
+}
+
+fn should_retry(error: &str, auto_retry: bool, attempt: usize, max_retries: usize) -> bool {
+    if !auto_retry || attempt >= max_retries {
+        return false;
+    }
+    let lower = error.to_ascii_lowercase();
+    // Retry on temporary network errors
+    lower.contains("timeout")
+        || lower.contains("timed out")
+        || lower.contains("connection reset")
+        || lower.contains("connection refused")
+        || lower.contains("temporary failure")
+        || lower.contains("tls error")
+        || lower.contains("ssl error")
+        || lower.contains("dns")
+        || lower.contains("name resolution")
+        || lower.contains("http 5")
+        || lower.contains("http 429")
+        || lower.contains("http 503")
+        || lower.contains("http 504")
+        || lower.contains("http 502")
+        || lower.contains("http 520")
+        || lower.contains("http 521")
+        || lower.contains("http 522")
+        || lower.contains("http 523")
+        || lower.contains("http 524")
 }
 
 enum DownloadError {

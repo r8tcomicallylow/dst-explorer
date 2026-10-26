@@ -320,6 +320,8 @@ pub struct Settings {
     pub show_tray_icon: bool,
     pub close_to_tray: bool,
     pub foobar2000_path: Option<PathBuf>,
+    pub auto_retry: bool,
+    pub max_retries: usize,
 }
 
 impl Default for Settings {
@@ -340,6 +342,8 @@ impl Default for Settings {
             show_tray_icon: true,
             close_to_tray: false,
             foobar2000_path: None,
+            auto_retry: true,
+            max_retries: 3,
         }
     }
 }
