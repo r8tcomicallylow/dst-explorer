@@ -256,6 +256,7 @@ pub struct App {
     selection_anchor: Option<u64>,
     dirty: bool,
     last_state_save: Instant,
+    had_active_downloads: bool,
 
     // Command palette
     palette_open: bool,
@@ -326,6 +327,7 @@ impl App {
             selection_anchor: None,
             dirty: false,
             last_state_save: Instant::now(),
+            had_active_downloads: false,
 
             // Command palette
             palette_open: false,
@@ -3674,10 +3676,20 @@ impl eframe::App for App {
             self.dl_ui.cache_checked = Instant::now();
         }
 
+        // Notify when all downloads complete
+        let has_active = self.downloads.running_count() > 0;
+        if self.had_active_downloads && !has_active {
+            if self.persisted.settings.notify_on_complete {
+                self.toast("All downloads complete", ToastTone::Success);
+                self.desktop_notify("All downloads complete", "All queued downloads have finished");
+            }
+        }
+        self.had_active_downloads = has_active;
+
         if self.latest_loading
             || self.search.loading
             || self.detail.as_ref().map(|d| d.loading).unwrap_or(false)
-            || self.downloads.running_count() > 0
+            || has_active
         {
             ctx.request_repaint_after(Duration::from_millis(180));
         }
