@@ -181,6 +181,7 @@ pub fn parse_grid(html: &str) -> Vec<Album> {
             format,
             xfd,
             is_new,
+            year: 0,
         });
     }
     albums

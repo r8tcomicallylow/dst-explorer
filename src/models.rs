@@ -21,6 +21,8 @@ pub struct Album {
     pub xfd: Option<String>,
     #[serde(default)]
     pub is_new: bool,
+    #[serde(default)]
+    pub year: u16,
 }
 
 impl Album {
