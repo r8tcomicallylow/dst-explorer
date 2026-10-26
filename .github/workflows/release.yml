@@ -32,7 +32,7 @@ jobs:
       - name: Prepare artifacts
         run: |
           mkdir release
-          copy target\release\doujin-explorer.exe release\doujin-explorer-windows-x64.exe
+          copy target\release\dst-explorer.exe release\dst-explorer-windows-x64.exe
           copy LICENSE release\
           copy README.md release\
       
@@ -40,7 +40,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            release/doujin-explorer-windows-x64.exe
+            release/dst-explorer-windows-x64.exe
             release/LICENSE
             release/README.md
           generate_release_notes: true
@@ -74,7 +74,7 @@ jobs:
       - name: Prepare artifacts
         run: |
           mkdir release
-          cp target/release/doujin-explorer release/doujin-explorer-linux-x64
+          cp target/release/dst-explorer release/dst-explorer-linux-x64
           cp LICENSE release/
           cp README.md release/
       
@@ -82,7 +82,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            release/doujin-explorer-linux-x64
+            release/dst-explorer-linux-x64
             release/LICENSE
             release/README.md
           generate_release_notes: true
@@ -112,14 +112,14 @@ jobs:
       - name: Create universal binary
         run: |
           lipo -create \
-            target/x86_64-apple-darwin/release/doujin-explorer \
-            target/aarch64-apple-darwin/release/doujin-explorer \
-            -output doujin-explorer-macos-universal
+            target/x86_64-apple-darwin/release/dst-explorer \
+            target/aarch64-apple-darwin/release/dst-explorer \
+            -output dst-explorer-macos-universal
       
       - name: Prepare artifacts
         run: |
           mkdir release
-          cp doujin-explorer-macos-universal release/
+          cp dst-explorer-macos-universal release/
           cp LICENSE release/
           cp README.md release/
       
@@ -127,7 +127,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            release/doujin-explorer-macos-universal
+            release/dst-explorer-macos-universal
             release/LICENSE
             release/README.md
           generate_release_notes: true

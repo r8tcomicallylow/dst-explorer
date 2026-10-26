@@ -15,11 +15,11 @@ use eframe::egui;
 use std::io::Write;
 
 fn main() -> eframe::Result<()> {
-    // Initialize logging if DOUJIN_EXPLORER_LOG is set
-    if std::env::var("DOUJIN_EXPLORER_LOG").is_ok() {
+    // Initialize logging if DST_EXPLORER_LOG is set
+    if std::env::var("DST_EXPLORER_LOG").is_ok() {
         let log_dir = crate::store::data_dir();
         let _ = std::fs::create_dir_all(&log_dir);
-        let log_file = log_dir.join("doujin-explorer.log");
+        let log_file = log_dir.join("dst-explorer.log");
         let file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -27,7 +27,7 @@ fn main() -> eframe::Result<()> {
             .ok();
         let log_file_clone = log_file.clone();
         if let Some(mut file) = file {
-            let _ = writeln!(file, "\n=== Doujin Explorer started at {} ===", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"));
+            let _ = writeln!(file, "\n=== DST-Explorer started at {} ===", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"));
         }
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
             .format_timestamp_millis()
@@ -37,7 +37,7 @@ fn main() -> eframe::Result<()> {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("Doujin Explorer")
+            .with_title("DST-Explorer")
             .with_inner_size([1200.0, 760.0])
             .with_min_inner_size([720.0, 520.0])
             .with_icon(std::sync::Arc::new(make_icon())),
@@ -48,7 +48,7 @@ fn main() -> eframe::Result<()> {
     };
 
     eframe::run_native(
-        "Doujin Explorer",
+        "DST-Explorer",
         options,
         Box::new(|cc| Ok(Box::new(App::new(cc)))),
     )

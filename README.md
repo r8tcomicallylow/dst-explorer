@@ -1,4 +1,4 @@
-# Doujin Explorer
+# DST-Explorer
 
 A fast, minimal desktop browser and download manager for [DoujinStyle](https://doujinstyle.com), written in Rust with `eframe`/`egui`.
 
@@ -32,21 +32,21 @@ A fast, minimal desktop browser and download manager for [DoujinStyle](https://d
 ### Portable (Recommended)
 
 Download the latest release for your platform:
-- **Windows**: `doujin-explorer-windows-x64.exe`
-- **Linux**: `doujin-explorer-linux-x64`
-- **macOS**: `doujin-explorer-macos-universal`
+- **Windows**: `dst-explorer-windows-x64.exe`
+- **Linux**: `dst-explorer-linux-x64`
+- **macOS**: `dst-explorer-macos-universal`
 
 No installation needed — just run the executable. All data is stored in platform-standard directories:
-- Windows: `%APPDATA%\DoujinExplorer\`
-- Linux: `~/.local/share/DoujinExplorer/`
-- macOS: `~/Library/Application Support/DoujinExplorer/`
+- Windows: `%APPDATA%\DST-Explorer\`
+- Linux: `~/.local/share/DST-Explorer/`
+- macOS: `~/Library/Application Support/DST-Explorer/`
 
 ### Build from Source
 
 ```bash
 # Requirements: Rust 1.75+
 cargo build --release
-# Binary at target/release/doujin-explorer[.exe]
+# Binary at target/release/dst-explorer[.exe]
 ```
 
 ## Usage
@@ -92,14 +92,14 @@ Settings → adjust:
 - foobar2000 executable path
 
 Data locations (override with env vars):
-- `DOUJIN_EXPLORER_DATA_DIR` — state.json, queue.json, watchlist, library
-- `DOUJIN_EXPLORER_CACHE_DIR` — image cache (thumbs/covers)
+- `DST_EXPLORER_DATA_DIR` — state.json, queue.json, watchlist, library
+- `DST_EXPLORER_CACHE_DIR` — image cache (thumbs/covers)
 
 ## Logging
 
-Set `DOUJIN_EXPLORER_LOG=1` to enable file logging:
+Set `DST_EXPLORER_LOG=1` to enable file logging:
 ```
-%APPDATA%\DoujinExplorer\doujin-explorer.log
+%APPDATA%\DST-Explorer\dst-explorer.log
 ```
 
 ## Disclaimer

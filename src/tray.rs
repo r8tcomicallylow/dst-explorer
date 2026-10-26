@@ -22,7 +22,7 @@ pub struct Tray {
 impl Tray {
     pub fn new(ctx: &egui::Context) -> Option<Self> {
         let menu = Menu::new();
-        let open = MenuItem::new("Open Doujin Explorer", true, None);
+        let open = MenuItem::new("Open DST-Explorer", true, None);
         let pause = MenuItem::new("Pause all downloads", true, None);
         let resume = MenuItem::new("Resume all downloads", true, None);
         let quit = MenuItem::new("Quit", true, None);
@@ -33,7 +33,7 @@ impl Tray {
 
         let tray = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
-            .with_tooltip("Doujin Explorer")
+            .with_tooltip("DST-Explorer")
             .with_icon(icon)
             .build()
             .ok()?;
