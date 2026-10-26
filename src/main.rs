@@ -7,6 +7,7 @@ mod images;
 mod models;
 mod persist;
 mod store;
+mod taskbar;
 mod theme;
 mod tray;
 

@@ -3585,7 +3585,7 @@ impl App {
 }
 
 impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.ensure_tray(ctx);
         self.handle_tray_actions(ctx);
         self.handle_close_request(ctx);
@@ -3603,6 +3603,50 @@ impl eframe::App for App {
         );
         let notices = self.downloads.poll();
         self.handle_download_notices(notices);
+        
+        // Update Windows taskbar progress
+        #[cfg(all(windows, feature = "taskbar-progress"))]
+        {
+            use crate::taskbar::{set_taskbar_progress, set_taskbar_error, set_taskbar_paused, clear_taskbar};
+            use crate::downloads::DownloadState;
+            use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+            
+            let mut total_downloaded: u64 = 0;
+            let mut total_size: u64 = 0;
+            let mut has_active = false;
+            let mut has_error = false;
+            let mut has_paused = false;
+            
+            for task in self.downloads.tasks.iter() {
+                match task.state {
+                    DownloadState::Downloading | DownloadState::Resolving | DownloadState::Extracting | DownloadState::Retrying { .. } => {
+                        has_active = true;
+                        total_downloaded += task.progress.downloaded();
+                        total_size += task.progress.total();
+                    }
+                    DownloadState::Failed => has_error = true,
+                    DownloadState::Paused => has_paused = true,
+                    _ => {}
+                }
+            }
+            
+            // Get HWND from the frame
+            if let Ok(handle) = frame.window_handle() {
+                if let RawWindowHandle::Win32(h) = handle.as_raw() {
+                    let hwnd = h.hwnd.get() as *mut std::ffi::c_void;
+                    
+                    if has_error {
+                        set_taskbar_error(hwnd);
+                    } else if has_paused && !has_active {
+                        set_taskbar_paused(hwnd);
+                    } else if has_active && total_size > 0 {
+                        set_taskbar_progress(hwnd, total_downloaded, total_size);
+                    } else {
+                        clear_taskbar(hwnd);
+                    }
+                }
+            }
+        }
         self.sync_library_from_downloads();
         self.poll_net();
         self.check_manual_downloads();
