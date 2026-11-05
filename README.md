@@ -3,8 +3,6 @@
 A fast, minimal desktop browser and download manager for [DoujinStyle](https://doujinstyle.com), written in Rust with `eframe`/`egui`.
 
 [![Release](https://github.com/r8tcomicallylow/dst-explorer/actions/workflows/release.yml/badge.svg)](https://github.com/r8tcomicallylow/dst-explorer/actions/workflows/release.yml)
-[![Release](https://github.com/r8tcomicallylow/dst-explorer/actions/workflows/release.yml/badge.svg)](https://github.com/r8tcomicallylow/dst-explorer/actions/workflows/release.yml)
-[![Release](https://github.com/r8tcomicallylow/dst-explorer/actions/workflows/release.yml/badge.svg)](https://github.com/r8tcomicallylow/dst-explorer/actions/workflows/release.yml)
 
 
 ## Features
