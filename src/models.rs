@@ -354,6 +354,12 @@ pub struct Settings {
     /// MPD server host (empty disables the integration).
     pub mpd_host: String,
     pub mpd_port: u16,
+    /// Enable the built-in audio preview player.
+    pub audio_enabled: bool,
+    /// Built-in player volume, 0.0..=1.0.
+    pub audio_volume: f32,
+    /// Use the light colour palette.
+    pub light_theme: bool,
 }
 
 impl Default for Settings {
@@ -393,6 +399,9 @@ impl Default for Settings {
             rss_feeds: Vec::new(),
             mpd_host: String::new(),
             mpd_port: 6600,
+            audio_enabled: true,
+            audio_volume: 0.8,
+            light_theme: false,
         }
     }
 }

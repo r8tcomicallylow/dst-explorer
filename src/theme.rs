@@ -1,23 +1,94 @@
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use eframe::egui::{
     self, pos2, vec2, Color32, FontData, FontDefinitions, FontFamily, FontId, Pos2, Rect, Response,
     Rounding, Sense, Shape, Stroke, TextStyle,
 };
 
-pub const BG: Color32 = Color32::from_rgb(11, 12, 17);
-pub const SIDEBAR: Color32 = Color32::from_rgb(15, 16, 23);
-pub const PANEL: Color32 = Color32::from_rgb(17, 18, 26);
-pub const CARD: Color32 = Color32::from_rgb(23, 25, 35);
-pub const CARD_HOVER: Color32 = Color32::from_rgb(30, 32, 44);
-pub const BORDER: Color32 = Color32::from_rgb(37, 39, 53);
-pub const BORDER_SOFT: Color32 = Color32::from_rgb(30, 32, 44);
-pub const TEXT: Color32 = Color32::from_rgb(236, 234, 245);
-pub const MUTED: Color32 = Color32::from_rgb(145, 147, 165);
-pub const DIM: Color32 = Color32::from_rgb(138, 140, 163);
-pub const DANGER: Color32 = Color32::from_rgb(255, 118, 132);
-pub const SUCCESS: Color32 = Color32::from_rgb(106, 219, 164);
-pub const WARNING: Color32 = Color32::from_rgb(255, 196, 112);
+static LIGHT: AtomicBool = AtomicBool::new(false);
+
+pub fn set_light(light: bool) {
+    LIGHT.store(light, Ordering::Relaxed);
+}
+
+pub fn is_light() -> bool {
+    LIGHT.load(Ordering::Relaxed)
+}
+
+macro_rules! palette {
+    ($name:ident, $dark:expr, $light:expr) => {
+        #[allow(non_snake_case)]
+        pub fn $name() -> Color32 {
+            if is_light() {
+                $light
+            } else {
+                $dark
+            }
+        }
+    };
+}
+
+palette!(BG, Color32::from_rgb(11, 12, 17), Color32::from_rgb(245, 244, 249));
+palette!(
+    SIDEBAR,
+    Color32::from_rgb(15, 16, 23),
+    Color32::from_rgb(236, 234, 243)
+);
+palette!(
+    PANEL,
+    Color32::from_rgb(17, 18, 26),
+    Color32::from_rgb(251, 250, 253)
+);
+palette!(
+    CARD,
+    Color32::from_rgb(23, 25, 35),
+    Color32::from_rgb(255, 255, 255)
+);
+palette!(
+    CARD_HOVER,
+    Color32::from_rgb(30, 32, 44),
+    Color32::from_rgb(241, 239, 248)
+);
+palette!(
+    BORDER,
+    Color32::from_rgb(37, 39, 53),
+    Color32::from_rgb(210, 205, 224)
+);
+palette!(
+    BORDER_SOFT,
+    Color32::from_rgb(30, 32, 44),
+    Color32::from_rgb(229, 226, 238)
+);
+palette!(
+    TEXT,
+    Color32::from_rgb(236, 234, 245),
+    Color32::from_rgb(31, 29, 41)
+);
+palette!(
+    MUTED,
+    Color32::from_rgb(145, 147, 165),
+    Color32::from_rgb(102, 98, 120)
+);
+palette!(
+    DIM,
+    Color32::from_rgb(138, 140, 163),
+    Color32::from_rgb(110, 106, 128)
+);
+palette!(
+    DANGER,
+    Color32::from_rgb(255, 118, 132),
+    Color32::from_rgb(190, 45, 66)
+);
+palette!(
+    SUCCESS,
+    Color32::from_rgb(106, 219, 164),
+    Color32::from_rgb(20, 122, 80)
+);
+palette!(
+    WARNING,
+    Color32::from_rgb(255, 196, 112),
+    Color32::from_rgb(150, 100, 0)
+);
 
 static ACCENT: AtomicU32 = AtomicU32::new(0xB7A5FF);
 
@@ -51,11 +122,19 @@ pub fn accent_dim(alpha: u8) -> Color32 {
 
 pub fn accent_dark() -> Color32 {
     let a = accent();
-    Color32::from_rgb(
-        (a.r() as f32 * 0.24) as u8,
-        (a.g() as f32 * 0.22) as u8,
-        (a.b() as f32 * 0.30) as u8,
-    )
+    if is_light() {
+        Color32::from_rgb(
+            (a.r() as f32 * 0.22 + 200.0) as u8,
+            (a.g() as f32 * 0.22 + 200.0) as u8,
+            (a.b() as f32 * 0.20 + 200.0) as u8,
+        )
+    } else {
+        Color32::from_rgb(
+            (a.r() as f32 * 0.24) as u8,
+            (a.g() as f32 * 0.22) as u8,
+            (a.b() as f32 * 0.30) as u8,
+        )
+    }
 }
 
 pub fn install_fonts(ctx: &egui::Context) {
@@ -81,7 +160,8 @@ pub fn install_fonts(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
-pub fn configure(ctx: &egui::Context, accent_index: usize) {
+pub fn configure(ctx: &egui::Context, accent_index: usize, light: bool) {
+    set_light(light);
     set_accent(accent_index);
     let mut style = (*ctx.style()).clone();
     style.visuals = visuals();
@@ -117,51 +197,60 @@ pub fn configure(ctx: &egui::Context, accent_index: usize) {
 }
 
 fn visuals() -> egui::Visuals {
-    let mut visuals = egui::Visuals::dark();
-    visuals.panel_fill = BG;
-    visuals.window_fill = PANEL;
-    visuals.extreme_bg_color = Color32::from_rgb(9, 10, 14);
-    visuals.faint_bg_color = CARD;
-    visuals.code_bg_color = CARD;
-    visuals.override_text_color = Some(TEXT);
+    let light = is_light();
+    let mut visuals = if light {
+        egui::Visuals::light()
+    } else {
+        egui::Visuals::dark()
+    };
+    visuals.panel_fill = BG();
+    visuals.window_fill = PANEL();
+    visuals.extreme_bg_color = if light {
+        Color32::from_rgb(238, 236, 244)
+    } else {
+        Color32::from_rgb(9, 10, 14)
+    };
+    visuals.faint_bg_color = CARD();
+    visuals.code_bg_color = CARD();
+    visuals.override_text_color = Some(TEXT());
     visuals.window_rounding = Rounding::same(14.0);
     visuals.menu_rounding = Rounding::same(10.0);
     visuals.window_shadow = egui::epaint::Shadow {
         offset: vec2(0.0, 10.0),
         blur: 30.0,
         spread: 0.0,
-        color: Color32::from_black_alpha(140),
+        color: Color32::from_black_alpha(if light { 40 } else { 140 }),
     };
     visuals.popup_shadow = egui::epaint::Shadow {
         offset: vec2(0.0, 4.0),
         blur: 18.0,
         spread: 0.0,
-        color: Color32::from_black_alpha(120),
+        color: Color32::from_black_alpha(if light { 30 } else { 120 }),
     };
-    visuals.selection.bg_fill = accent_dim(80);
+    visuals.selection.bg_fill = accent_dim(if light { 60 } else { 80 });
     visuals.selection.stroke = Stroke::new(1.0_f32, accent());
     visuals.hyperlink_color = accent();
-    visuals.widgets.noninteractive.bg_fill = PANEL;
-    visuals.widgets.noninteractive.weak_bg_fill = PANEL;
-    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, BORDER_SOFT);
+    visuals.widgets.noninteractive.bg_fill = PANEL();
+    visuals.widgets.noninteractive.weak_bg_fill = PANEL();
+    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, BORDER_SOFT());
     visuals.widgets.noninteractive.rounding = Rounding::same(9.0);
-    visuals.widgets.inactive.bg_fill = CARD;
-    visuals.widgets.inactive.weak_bg_fill = CARD;
-    visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, BORDER_SOFT);
+    visuals.widgets.inactive.bg_fill = CARD();
+    visuals.widgets.inactive.weak_bg_fill = CARD();
+    visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, BORDER_SOFT());
     visuals.widgets.inactive.rounding = Rounding::same(9.0);
-    visuals.widgets.hovered.bg_fill = CARD_HOVER;
-    visuals.widgets.hovered.weak_bg_fill = CARD_HOVER;
-    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, BORDER);
+    visuals.widgets.hovered.bg_fill = CARD_HOVER();
+    visuals.widgets.hovered.weak_bg_fill = CARD_HOVER();
+    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, BORDER());
     visuals.widgets.hovered.rounding = Rounding::same(9.0);
     visuals.widgets.active.bg_fill = accent_dark();
     visuals.widgets.active.weak_bg_fill = accent_dark();
     visuals.widgets.active.bg_stroke = Stroke::new(1.0_f32, accent());
     visuals.widgets.active.rounding = Rounding::same(9.0);
-    visuals.widgets.open.bg_fill = CARD_HOVER;
-    visuals.widgets.open.weak_bg_fill = CARD_HOVER;
-    visuals.widgets.open.bg_stroke = Stroke::new(1.0_f32, BORDER);
+    visuals.widgets.open.bg_fill = CARD_HOVER();
+    visuals.widgets.open.weak_bg_fill = CARD_HOVER();
+    visuals.widgets.open.bg_stroke = Stroke::new(1.0_f32, BORDER());
     visuals.widgets.open.rounding = Rounding::same(9.0);
-    visuals.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, TEXT);
+    visuals.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, TEXT());
     visuals
 }
 
@@ -185,17 +274,17 @@ pub fn primary_button_w(ui: &mut egui::Ui, text: impl Into<String>, width: f32) 
 
 pub fn small_button(ui: &mut egui::Ui, text: impl Into<String>, tint: Color32) -> Response {
     let button = egui::Button::new(egui::RichText::new(text.into()).size(11.0).color(tint))
-        .fill(CARD)
-        .stroke(Stroke::new(1.0_f32, BORDER_SOFT))
+        .fill(CARD())
+        .stroke(Stroke::new(1.0_f32, BORDER_SOFT()))
         .rounding(Rounding::same(7.0))
         .min_size(vec2(0.0, 26.0));
     ui.add(button)
 }
 
 pub fn secondary_button(ui: &mut egui::Ui, text: impl Into<String>) -> Response {
-    let button = egui::Button::new(egui::RichText::new(text.into()).size(13.0).color(TEXT))
-        .fill(CARD)
-        .stroke(Stroke::new(1.0_f32, BORDER))
+    let button = egui::Button::new(egui::RichText::new(text.into()).size(13.0).color(TEXT()))
+        .fill(CARD())
+        .stroke(Stroke::new(1.0_f32, BORDER()))
         .rounding(Rounding::same(9.0))
         .min_size(vec2(0.0, 34.0));
     ui.add(button)
@@ -206,7 +295,7 @@ pub fn chip(ui: &mut egui::Ui, text: impl Into<String>, selected: bool) -> Respo
     let color = if selected {
         Color32::from_rgb(14, 15, 21)
     } else {
-        MUTED
+        MUTED()
     };
     let galley = ui
         .painter()
@@ -217,16 +306,16 @@ pub fn chip(ui: &mut egui::Ui, text: impl Into<String>, selected: bool) -> Respo
     let bg = if selected {
         accent()
     } else if hovered {
-        CARD_HOVER
+        CARD_HOVER()
     } else {
-        CARD
+        CARD()
     };
     ui.painter().rect_filled(rect, Rounding::same(8.0), bg);
     if !selected {
         ui.painter().rect_stroke(
             rect,
             Rounding::same(8.0),
-            Stroke::new(1.0_f32, if hovered { BORDER } else { BORDER_SOFT }),
+            Stroke::new(1.0_f32, if hovered { BORDER() } else { BORDER_SOFT() }),
         );
     }
     ui.painter()
@@ -262,12 +351,17 @@ pub enum Icon {
     Alert,
     Grid,
     Folder,
+    Play,
+    Pause,
+    Previous,
+    Next,
+    Volume,
 }
 
 pub fn icon_button(ui: &mut egui::Ui, icon: Icon, size: f32, tint: Color32) -> Response {
     let (rect, response) = ui.allocate_exact_size(vec2(size, size), Sense::click());
     let bg = if response.hovered() {
-        CARD_HOVER
+        CARD_HOVER()
     } else {
         Color32::TRANSPARENT
     };
@@ -450,6 +544,64 @@ pub fn paint_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color3
                 stroke,
             ));
         }
+        Icon::Play => {
+            painter.add(Shape::convex_polygon(
+                vec![pt(0.32, 0.18), pt(0.82, 0.5), pt(0.32, 0.82)],
+                color,
+                Stroke::NONE,
+            ));
+        }
+        Icon::Pause => {
+            painter.rect_filled(
+                Rect::from_min_size(pt(0.28, 0.2), vec2(rect.width() * 0.16, rect.height() * 0.6)),
+                Rounding::same(1.5),
+                color,
+            );
+            painter.rect_filled(
+                Rect::from_min_size(pt(0.56, 0.2), vec2(rect.width() * 0.16, rect.height() * 0.6)),
+                Rounding::same(1.5),
+                color,
+            );
+        }
+        Icon::Previous => {
+            painter.rect_filled(
+                Rect::from_min_size(pt(0.2, 0.2), vec2(rect.width() * 0.1, rect.height() * 0.6)),
+                Rounding::same(1.5),
+                color,
+            );
+            painter.add(Shape::convex_polygon(
+                vec![pt(0.82, 0.18), pt(0.32, 0.5), pt(0.82, 0.82)],
+                color,
+                Stroke::NONE,
+            ));
+        }
+        Icon::Next => {
+            painter.add(Shape::convex_polygon(
+                vec![pt(0.18, 0.18), pt(0.68, 0.5), pt(0.18, 0.82)],
+                color,
+                Stroke::NONE,
+            ));
+            painter.rect_filled(
+                Rect::from_min_size(pt(0.7, 0.2), vec2(rect.width() * 0.1, rect.height() * 0.6)),
+                Rounding::same(1.5),
+                color,
+            );
+        }
+        Icon::Volume => {
+            painter.add(Shape::convex_polygon(
+                vec![pt(0.12, 0.38), pt(0.32, 0.38), pt(0.52, 0.2), pt(0.52, 0.8), pt(0.32, 0.62), pt(0.12, 0.62)],
+                color,
+                Stroke::NONE,
+            ));
+            painter.add(Shape::line(
+                vec![pt(0.64, 0.34), pt(0.74, 0.5), pt(0.64, 0.66)],
+                Stroke::new(width * 1.1, color),
+            ));
+            painter.add(Shape::line(
+                vec![pt(0.76, 0.22), pt(0.9, 0.5), pt(0.76, 0.78)],
+                Stroke::new(width * 1.1, color),
+            ));
+        }
     }
 }
 
@@ -466,7 +618,7 @@ fn star_points(center: Pos2, outer: f32, inner: f32) -> Vec<Pos2> {
 pub fn progress_bar(ui: &mut egui::Ui, fraction: Option<f32>, width: f32, height: f32) {
     let (rect, _) = ui.allocate_exact_size(vec2(width, height), Sense::hover());
     ui.painter()
-        .rect_filled(rect, Rounding::same(height * 0.5), BORDER_SOFT);
+        .rect_filled(rect, Rounding::same(height * 0.5), BORDER_SOFT());
     if let Some(fraction) = fraction {
         if fraction > 0.0 {
             let fill = Rect::from_min_size(
