@@ -46,6 +46,9 @@ All notable changes to this project will be documented in this format.
 - UI scale slider no longer jumps back and forth; zoom is applied when the drag ends
 - Waveform scrubbing previews the position while dragging and seeks once on release
 - Seeking after a gapless track transition now uses the correct offset inside the sink
+- Player bar no longer clips the track duration; the time label and volume controls have reserved space
+- Library thumbnails use their own texture key, so a small row cover can no longer blur the grid artwork
+- Library warning badge showed the literal text `WARNING()` instead of `WARNING`
 
 ## [1.2.0] - 2026-11-06
 
