@@ -38,6 +38,9 @@ All notable changes to this project will be documented in this format.
 
 ### Changed
 - Player queue handling now resets prefetch state correctly when shuffle, repeat or resume changes
+- Lower memory footprint: photo cache now has a 20 MB byte cap in addition to the entry limit,
+  thumbnails and covers decode at smaller sizes, image workers share one HTTP client,
+  and locale bundles are parsed lazily instead of all five at startup
 
 ### Fixed
 - UI scale slider no longer jumps back and forth; zoom is applied when the drag ends
