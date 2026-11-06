@@ -14,8 +14,8 @@ use crate::downloads::{DownloadManager, DownloadNotice, DownloadState};
 use crate::images::{ImageLoader, ImageSpec, Textures};
 use crate::i18n::{negotiate_best_language, I18n, Language};
 use crate::models::{
-    sort_albums, Album, AlbumDetail, FormatFilter, LibraryEntry, Persisted, RuleField, SaveRule,
-    SearchKind, SearchSort, WatchMeta,
+    is_lossless_format, sort_albums, Album, AlbumDetail, FormatFilter, LibraryEntry, LibrarySort,
+    Persisted, RuleField, SaveRule, SearchKind, SearchSort, WatchMeta,
 };
 use crate::store;
 use crate::theme::{
@@ -118,6 +118,9 @@ enum NetEvent {
         id: u64,
         result: Result<AlbumDetail, String>,
     },
+    Rss {
+        items: Vec<(String, String)>,
+    },
 }
 
 #[derive(Clone)]
@@ -161,12 +164,53 @@ enum DetailAction {
     WatchMetaChanged,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QualityFilter {
+    Any,
+    Lossless,
+    Lossy,
+}
+
+impl QualityFilter {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Any => "Any quality",
+            Self::Lossless => "Lossless",
+            Self::Lossy => "Lossy",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AvailabilityFilter {
+    Any,
+    New,
+    InLibrary,
+    Queued,
+    NotOwned,
+}
+
+impl AvailabilityFilter {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Any => "All results",
+            Self::New => "NEW only",
+            Self::InLibrary => "In library",
+            Self::Queued => "In queue",
+            Self::NotOwned => "Not owned",
+        }
+    }
+}
+
 enum TaskAction {
     Pause(u64),
     Resume(u64),
     Cancel(u64),
     Retry(u64),
     Remove(u64),
+    Prioritize(u64),
+    MoveUp(u64),
+    MoveDown(u64),
     OpenFolder(u64),
     OpenUrl(String),
     OpenAlbum(Album),
@@ -184,6 +228,13 @@ struct Toast {
     text: String,
     created: Instant,
     tone: ToastTone,
+    action: Option<ToastAction>,
+}
+
+#[derive(Clone)]
+enum ToastAction {
+    OpenFolder(PathBuf),
+    OpenUrl(String),
 }
 
 #[derive(Clone, Copy)]
@@ -254,6 +305,14 @@ pub struct App {
     library_query: String,
     library_format_filter: Option<String>,
     library_year_filter: Option<u16>,
+    search_regex: bool,
+    search_quality: QualityFilter,
+    search_availability: AvailabilityFilter,
+    pending_bulk: Option<Vec<Album>>,
+    stats_open: bool,
+    notified_matches: HashSet<(String, u64)>,
+    rss_draft: String,
+    rss_checked: bool,
     watch_filter: WatchFilter,
     folder_draft: Option<String>,
     folder_rename: Option<(String, String)>,
@@ -328,6 +387,14 @@ impl App {
             library_query: String::new(),
             library_format_filter: None,
             library_year_filter: None,
+            search_regex: false,
+            search_quality: QualityFilter::Any,
+            search_availability: AvailabilityFilter::Any,
+            pending_bulk: None,
+            stats_open: false,
+            notified_matches: HashSet::new(),
+            rss_draft: String::new(),
+            rss_checked: false,
             watch_filter: WatchFilter::All,
             folder_draft: None,
             folder_rename: None,
@@ -355,13 +422,24 @@ impl App {
         app.i18n.set_language(lang);
         if app.downloads.restored_paused > 0 {
             let count = app.downloads.restored_paused;
-            app.toast(
-                format!(
-                    "Restored {count} paused download{}. Resume them in Downloads.",
-                    if count == 1 { "" } else { "s" }
-                ),
-                ToastTone::Info,
-            );
+            if app.persisted.settings.resume_on_start {
+                app.downloads.resume_all();
+                app.toast(
+                    format!(
+                        "Resumed {count} download{} from the previous session.",
+                        if count == 1 { "" } else { "s" }
+                    ),
+                    ToastTone::Success,
+                );
+            } else {
+                app.toast(
+                    format!(
+                        "Restored {count} paused download{}. Resume them in Downloads.",
+                        if count == 1 { "" } else { "s" }
+                    ),
+                    ToastTone::Info,
+                );
+            }
         }
         app
     }
@@ -539,10 +617,56 @@ impl App {
     }
 
     fn rebuild_search_display(&mut self) {
-        self.search.display = sort_albums(
-            self.search.results.clone(),
-            self.persisted.settings.search_sort,
-        );
+        let mut albums = self.search.results.clone();
+        let quality = self.search_quality;
+        if quality != QualityFilter::Any {
+            albums.retain(|album| {
+                if album.format.trim().is_empty() {
+                    return false;
+                }
+                let lossless = is_lossless_format(&album.format);
+                if quality == QualityFilter::Lossless {
+                    lossless
+                } else {
+                    !lossless
+                }
+            });
+        }
+        let availability = self.search_availability;
+        if availability != AvailabilityFilter::Any {
+            let queued: HashSet<u64> = self
+                .downloads
+                .tasks
+                .iter()
+                .filter(|task| task.state.is_active() || task.state == DownloadState::Paused)
+                .map(|task| task.album.id)
+                .collect();
+            albums.retain(|album| match availability {
+                AvailabilityFilter::Any => true,
+                AvailabilityFilter::New => album.is_new,
+                AvailabilityFilter::InLibrary => self.persisted.in_library(album.id),
+                AvailabilityFilter::Queued => queued.contains(&album.id),
+                AvailabilityFilter::NotOwned => {
+                    !self.persisted.in_library(album.id) && !queued.contains(&album.id)
+                }
+            });
+        }
+        if self.search_regex {
+            let pattern = self.search.query.trim();
+            if !pattern.is_empty() {
+                if let Ok(regex) = regex::RegexBuilder::new(pattern)
+                    .case_insensitive(true)
+                    .build()
+                {
+                    albums.retain(|album| {
+                        regex.is_match(&album.title)
+                            || regex.is_match(&album.artist)
+                            || album.tags.iter().any(|tag| regex.is_match(tag))
+                    });
+                }
+            }
+        }
+        self.search.display = sort_albums(albums, self.persisted.settings.search_sort);
     }
 
     fn run_search(&mut self, text: String, kind: SearchKind, formats: FormatFilter) {
@@ -610,6 +734,35 @@ impl App {
         }
     }
 
+    fn check_rss_feeds(&mut self) {
+        let feeds = self.persisted.settings.rss_feeds.clone();
+        if feeds.is_empty() {
+            return;
+        }
+        let tx = self.net_tx.clone();
+        let _ = thread::Builder::new()
+            .name("rss-feeds".into())
+            .spawn(move || {
+                let client = reqwest::blocking::Client::builder()
+                    .user_agent(crate::api::USER_AGENT)
+                    .timeout(Duration::from_secs(20))
+                    .connect_timeout(Duration::from_secs(10))
+                    .build();
+                let Ok(client) = client else {
+                    return;
+                };
+                let mut items = Vec::new();
+                for feed in feeds {
+                    if let Ok(response) = client.get(&feed).send() {
+                        if let Ok(text) = response.text() {
+                            items.extend(parse_feed_items(&text));
+                        }
+                    }
+                }
+                let _ = tx.send(NetEvent::Rss { items });
+            });
+    }
+
     fn poll_net(&mut self) {
         loop {
             let event = match self.net_rx.try_recv() {
@@ -660,6 +813,53 @@ impl App {
                                     ),
                                     ToastTone::Success,
                                 );
+                            }
+                            if page == 0
+                                && self.persisted.settings.notify_saved_searches
+                                && !self.persisted.saved_searches.is_empty()
+                            {
+                                let mut hits: Vec<(String, String)> = Vec::new();
+                                for saved in &self.persisted.saved_searches {
+                                    let needle = saved.text.trim().to_lowercase();
+                                    if needle.is_empty() {
+                                        continue;
+                                    }
+                                    for album in &fetched {
+                                        let matched = match saved.kind {
+                                            SearchKind::Artist => {
+                                                album.artist.to_lowercase().contains(&needle)
+                                            }
+                                            SearchKind::Tags => album
+                                                .tags
+                                                .iter()
+                                                .any(|tag| tag.to_lowercase().contains(&needle)),
+                                            _ => {
+                                                album.title.to_lowercase().contains(&needle)
+                                                    || album
+                                                        .artist
+                                                        .to_lowercase()
+                                                        .contains(&needle)
+                                            }
+                                        };
+                                        if matched
+                                            && self
+                                                .notified_matches
+                                                .insert((saved.name.clone(), album.id))
+                                        {
+                                            hits.push((saved.name.clone(), album.title.clone()));
+                                        }
+                                    }
+                                }
+                                for (name, title) in hits.into_iter().take(3) {
+                                    self.toast(
+                                        format!("“{name}”: new release “{title}”"),
+                                        ToastTone::Success,
+                                    );
+                                    self.desktop_notify(
+                                        &format!("Saved search “{name}” matched"),
+                                        &title,
+                                    );
+                                }
                             }
                             self.latest_new_count = self.latest.iter().filter(|a| a.is_new).count();
                             self.latest_next_page = page + 1;
@@ -727,8 +927,28 @@ impl App {
                         }
                     }
                 }
-                NetEvent::Detail { id, result } => {
-                    if let Some(detail) = self.detail.as_mut() {
+                NetEvent::Rss { items } => {
+                    let mut fresh = 0;
+                    for (title, link) in items {
+                        if self.persisted.rss_seen.iter().any(|seen| seen == &link) {
+                            continue;
+                        }
+                        self.persisted.rss_seen.push(link);
+                        if fresh < 3 {
+                            self.toast(format!("New release: {title}"), ToastTone::Info);
+                            self.desktop_notify("New release", &title);
+                        }
+                        fresh += 1;
+                    }
+                    if self.persisted.rss_seen.len() > 500 {
+                        let excess = self.persisted.rss_seen.len() - 500;
+                        self.persisted.rss_seen.drain(0..excess);
+                    }
+                    if fresh > 0 {
+                        self.dirty = true;
+                    }
+                }
+                NetEvent::Detail { id, result } => {                    if let Some(detail) = self.detail.as_mut() {
                         if detail.album.id != id {
                             continue;
                         }
@@ -754,7 +974,7 @@ impl App {
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
         let typing = ctx.wants_keyboard_input();
-        let (search_shortcut, refresh, escape, download, palette, shortcuts_help, nav_keys) = ctx.input(|input| {
+        let (search_shortcut, refresh, escape, download, palette, shortcuts_help, nav_keys, fullscreen, pause_all, resume_all, cycle_theme) = ctx.input(|input| {
             (
                 (input.modifiers.command && input.key_pressed(egui::Key::F))
                     || (!typing && input.key_pressed(egui::Key::Slash)),
@@ -772,6 +992,10 @@ impl App {
                     input.key_pressed(egui::Key::Num5),
                     input.key_pressed(egui::Key::Num6),
                 ],
+                input.key_pressed(egui::Key::F11),
+                input.modifiers.alt && input.modifiers.command && input.key_pressed(egui::Key::P),
+                input.modifiers.alt && input.modifiers.command && input.key_pressed(egui::Key::R),
+                input.modifiers.alt && input.modifiers.command && input.key_pressed(egui::Key::T),
             )
         });
 
@@ -818,6 +1042,31 @@ impl App {
         }
         if palette {
             self.open_command_palette();
+        }
+        if fullscreen {
+            let is_fullscreen = ctx.input(|input| input.viewport().fullscreen.unwrap_or(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!is_fullscreen));
+            if !is_fullscreen && self.detail.is_some() {
+                self.preview_cover = true;
+            }
+        }
+        if pause_all {
+            self.downloads.pause_all();
+            self.toast("All downloads paused.", ToastTone::Info);
+        }
+        if resume_all {
+            self.downloads.resume_all();
+            self.toast("Downloads resumed.", ToastTone::Info);
+        }
+        if cycle_theme {
+            let next = (self.persisted.settings.accent + 1) % ACCENTS.len();
+            self.persisted.settings.accent = next;
+            theme::set_accent(next);
+            self.dirty = true;
+            self.toast(
+                format!("Theme accent: {}", ACCENTS[next].0),
+                ToastTone::Info,
+            );
         }
         if shortcuts_help {
             self.show_shortcuts = !self.show_shortcuts;
@@ -875,10 +1124,24 @@ impl App {
     }
 
     fn toast(&mut self, text: impl Into<String>, tone: ToastTone) {
+        self.push_toast(text.into(), tone, None);
+    }
+
+    fn toast_action(
+        &mut self,
+        text: impl Into<String>,
+        tone: ToastTone,
+        action: ToastAction,
+    ) {
+        self.push_toast(text.into(), tone, Some(action));
+    }
+
+    fn push_toast(&mut self, text: String, tone: ToastTone, action: Option<ToastAction>) {
         self.toasts.push(Toast {
-            text: text.into(),
+            text,
             created: Instant::now(),
             tone,
+            action,
         });
         if self.toasts.len() > 5 {
             self.toasts.remove(0);
@@ -1184,6 +1447,14 @@ impl App {
         if albums.is_empty() {
             return;
         }
+        if self.persisted.settings.confirm_bulk && albums.len() > 1 {
+            self.pending_bulk = Some(albums);
+            return;
+        }
+        self.enqueue_bulk(albums);
+    }
+
+    fn enqueue_bulk(&mut self, albums: Vec<Album>) {
         let count = albums.len();
         for album in albums {
             self.downloads.enqueue(album);
@@ -1274,6 +1545,9 @@ impl App {
                     self.dl_ui.manual_opened.remove(&id);
                     self.downloads.remove(id);
                 }
+                TaskAction::Prioritize(id) => self.downloads.prioritize(id),
+                TaskAction::MoveUp(id) => self.downloads.move_up(id),
+                TaskAction::MoveDown(id) => self.downloads.move_down(id),
                 TaskAction::OpenFolder(id) => {
                     if let Some(task) = self.downloads.tasks.iter().find(|t| t.id == id) {
                         if let Some(folder) = &task.extracted {
@@ -1302,10 +1576,12 @@ impl App {
                     .arg("/add")
                     .arg(path)
                     .spawn();
-            } else {
-                eprintln!("foobar2000 not found at: {}", foobar_path.display());
+                return;
             }
+            eprintln!("foobar2000 not found at: {}", foobar_path.display());
         }
+        // Fall back to the system's default handler so playback still works.
+        store::open_path(path);
     }
 
     fn check_manual_downloads(&mut self) {
@@ -1320,9 +1596,10 @@ impl App {
         for (id, url, title) in newly_manual {
             self.dl_ui.manual_opened.insert(id);
             let _ = webbrowser::open(&url);
-            self.toast(
+            self.toast_action(
                 format!("“{title}” needs a browser. Opened the host page."),
                 ToastTone::Info,
+                ToastAction::OpenUrl(url),
             );
         }
     }
@@ -1331,7 +1608,15 @@ impl App {
         for notice in notices {
             match notice {
                 DownloadNotice::Completed { title, output } => {
-                    self.toast(format!("Downloaded “{title}”"), ToastTone::Success);
+                    let folder = output
+                        .parent()
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|| output.clone());
+                    self.toast_action(
+                        format!("Downloaded “{title}”"),
+                        ToastTone::Success,
+                        ToastAction::OpenFolder(folder),
+                    );
                     if self.persisted.settings.notify_on_complete {
                         let detail = output
                             .file_name()
@@ -1704,6 +1989,7 @@ impl App {
             &mut requests,
             self.persisted.settings.show_new_badges,
             footer,
+            self.persisted.settings.compact_grid,
             &format!("latest-{}", self.latest_gen),
         );
         self.request_images(requests);
@@ -1981,6 +2267,77 @@ impl App {
             }
         }
 
+        if self.search.searched {
+            let mut filters_changed = false;
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new("FILTER").size(9.5).strong().color(DIM));
+                ui.add_space(2.0);
+                if theme::chip(ui, "Regex", self.search_regex).clicked() {
+                    self.search_regex = !self.search_regex;
+                    filters_changed = true;
+                }
+                egui::ComboBox::from_id_salt("search-quality")
+                    .selected_text(self.search_quality.label())
+                    .width(120.0)
+                    .show_ui(ui, |ui| {
+                        for value in [
+                            QualityFilter::Any,
+                            QualityFilter::Lossless,
+                            QualityFilter::Lossy,
+                        ] {
+                            if ui
+                                .selectable_value(
+                                    &mut self.search_quality,
+                                    value,
+                                    value.label(),
+                                )
+                                .changed()
+                            {
+                                filters_changed = true;
+                            }
+                        }
+                    });
+                egui::ComboBox::from_id_salt("search-availability")
+                    .selected_text(self.search_availability.label())
+                    .width(130.0)
+                    .show_ui(ui, |ui| {
+                        for value in [
+                            AvailabilityFilter::Any,
+                            AvailabilityFilter::New,
+                            AvailabilityFilter::InLibrary,
+                            AvailabilityFilter::Queued,
+                            AvailabilityFilter::NotOwned,
+                        ] {
+                            if ui
+                                .selectable_value(
+                                    &mut self.search_availability,
+                                    value,
+                                    value.label(),
+                                )
+                                .changed()
+                            {
+                                filters_changed = true;
+                            }
+                        }
+                    });
+                if self.search_regex
+                    && regex::RegexBuilder::new(self.search.query.trim())
+                        .case_insensitive(true)
+                        .build()
+                        .is_err()
+                {
+                    ui.label(
+                        egui::RichText::new("invalid pattern")
+                            .size(10.0)
+                            .color(DANGER),
+                    );
+                }
+            });
+            if filters_changed {
+                self.rebuild_search_display();
+            }
+        }
+
         ui.add_space(8.0);
         ui.horizontal_wrapped(|ui| {
             if self.search.searched {
@@ -2110,6 +2467,7 @@ impl App {
             &mut requests,
             false,
             footer,
+            self.persisted.settings.compact_grid,
             &format!("search-{}", self.search.gen),
         );
         self.request_images(requests);
@@ -2372,6 +2730,7 @@ impl App {
             &mut requests,
             false,
             GridFooter::None,
+            self.persisted.settings.compact_grid,
             "watchlist",
         );
         self.request_images(requests);
@@ -2388,6 +2747,9 @@ impl App {
             store::human_size(total)
         );
         view_header(ui, self.t("collection"), self.t("library-title"), subtitle, |ui| {
+            if theme::secondary_button(ui, "Statistics").clicked() {
+                self.stats_open = !self.stats_open;
+            }
             if theme::secondary_button(ui, self.t("open-downloads-folder")).clicked() {
                 let dir = self.persisted.settings.download_dir.clone();
                 let _ = std::fs::create_dir_all(&dir);
@@ -2395,6 +2757,46 @@ impl App {
             }
         });
         ui.add_space(8.0);
+
+        if self.stats_open && count > 0 {
+            let lossless = self
+                .persisted
+                .library
+                .iter()
+                .filter(|entry| is_lossless_format(&entry.album.format))
+                .count();
+            let lossy = count.saturating_sub(lossless);
+            let missing = self
+                .persisted
+                .library
+                .iter()
+                .filter(|entry| entry.missing())
+                .count();
+            let average = if count > 0 { total / count as u64 } else { 0 };
+            Frame::none()
+                .fill(PANEL)
+                .stroke(Stroke::new(1.0_f32, BORDER_SOFT))
+                .rounding(Rounding::same(11.0))
+                .inner_margin(Margin::symmetric(14.0, 10.0))
+                .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        let stat = |ui: &mut Ui, label: &str, value: String, color: Color32| {
+                            ui.vertical(|ui| {
+                                ui.label(egui::RichText::new(value).size(15.0).strong().color(color));
+                                ui.label(egui::RichText::new(label).size(9.5).color(DIM));
+                            });
+                            ui.add_space(18.0);
+                        };
+                        stat(ui, "ALBUMS", format_number(count), TEXT);
+                        stat(ui, "TOTAL SIZE", store::human_size(total), TEXT);
+                        stat(ui, "AVERAGE", store::human_size(average), TEXT);
+                        stat(ui, "LOSSLESS", format_number(lossless), SUCCESS);
+                        stat(ui, "LOSSY", format_number(lossy), MUTED);
+                        stat(ui, "MISSING", format_number(missing), if missing > 0 { DANGER } else { DIM });
+                    });
+                });
+            ui.add_space(8.0);
+        }
 
         // Filter toolbar
         ui.horizontal(|ui| {
@@ -2428,6 +2830,20 @@ impl App {
                     ui.selectable_value(&mut self.library_year_filter, None, "All years");
                     for year in &years {
                         ui.selectable_value(&mut self.library_year_filter, Some(*year), year.to_string());
+                    }
+                });
+
+            ui.add_space(8.0);
+            egui::ComboBox::from_id_salt("library_sort")
+                .selected_text(format!("Sort: {}", self.persisted.settings.library_sort.label()))
+                .width(140.0)
+                .show_ui(ui, |ui| {
+                    for sort in LibrarySort::ALL {
+                        ui.selectable_value(
+                            &mut self.persisted.settings.library_sort,
+                            sort,
+                            sort.label(),
+                        );
                     }
                 });
 
@@ -2484,7 +2900,7 @@ impl App {
         let query = self.library_query.trim().to_lowercase();
         let format_filter = &self.library_format_filter;
         let year_filter = self.library_year_filter;
-        let visible: Vec<usize> = self
+        let mut visible: Vec<usize> = self
             .persisted
             .library
             .iter()
@@ -2507,6 +2923,32 @@ impl App {
             })
             .map(|(index, _)| index)
             .collect();
+
+        let sort = self.persisted.settings.library_sort;
+        let library = &self.persisted.library;
+        visible.sort_by(|a, b| {
+            let left = &library[*a];
+            let right = &library[*b];
+            match sort {
+                LibrarySort::Title => left
+                    .album
+                    .title
+                    .to_lowercase()
+                    .cmp(&right.album.title.to_lowercase()),
+                LibrarySort::Artist => left
+                    .album
+                    .artist
+                    .to_lowercase()
+                    .cmp(&right.album.artist.to_lowercase()),
+                LibrarySort::Format => left
+                    .album
+                    .format
+                    .to_lowercase()
+                    .cmp(&right.album.format.to_lowercase()),
+                LibrarySort::Size => right.size.cmp(&left.size),
+                LibrarySort::Newest => right.completed_at.cmp(&left.completed_at),
+            }
+        });
 
         if visible.is_empty() {
             draw_empty(
@@ -2613,10 +3055,29 @@ impl App {
                                             if !entry.album.format.is_empty() {
                                                 parts.push(entry.album.format.clone());
                                             }
+                                            if self.persisted.settings.library_show_year
+                                                && entry.album.year > 0
+                                            {
+                                                parts.push(entry.album.year.to_string());
+                                            }
                                             parts.push(store::human_size(entry.size));
                                             let when = format_relative_time(entry.completed_at);
                                             if !when.is_empty() {
                                                 parts.push(when);
+                                            }
+                                            if self.persisted.settings.library_show_tags
+                                                && !entry.album.tags.is_empty()
+                                            {
+                                                parts.push(
+                                                    entry
+                                                        .album
+                                                        .tags
+                                                        .iter()
+                                                        .take(3)
+                                                        .cloned()
+                                                        .collect::<Vec<_>>()
+                                                        .join(", "),
+                                                );
                                             }
                                             ui.label(
                                                 egui::RichText::new(parts.join(" · "))
@@ -2761,6 +3222,43 @@ impl App {
             }
         });
         ui.add_space(14.0);
+
+        if !self.downloads.tasks.is_empty() {
+            let hosts = self.downloads.hosts();
+            if !hosts.is_empty() {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new("HOSTS").size(9.5).strong().color(DIM));
+                    ui.add_space(2.0);
+                    for host in hosts {
+                        let active = self
+                            .downloads
+                            .tasks
+                            .iter()
+                            .any(|task| task.host.as_deref() == Some(host.as_str()) && task.state.is_active());
+                        let paused = self
+                            .downloads
+                            .tasks
+                            .iter()
+                            .any(|task| task.host.as_deref() == Some(host.as_str()) && task.state == DownloadState::Paused);
+                        let label = if paused && !active {
+                            format!("{host} · paused")
+                        } else {
+                            host.clone()
+                        };
+                        if theme::chip(ui, &label, active).clicked() {
+                            if paused && !active {
+                                self.downloads.resume_host(&host);
+                                self.toast(format!("Resumed downloads from {host}."), ToastTone::Info);
+                            } else {
+                                self.downloads.pause_host(&host);
+                                self.toast(format!("Paused downloads from {host}."), ToastTone::Info);
+                            }
+                        }
+                    }
+                });
+                ui.add_space(10.0);
+            }
+        }
 
         if self.downloads.tasks.is_empty() {
             draw_empty(
@@ -3156,6 +3654,113 @@ impl App {
                 });
 
                 ui.add_space(14.0);
+                settings_card(ui, "Automation", |ui| {
+                    let delete_source = "Delete source archive after extraction";
+                    if ui
+                        .checkbox(
+                            &mut self.persisted.settings.delete_source_after_extract,
+                            egui::RichText::new(delete_source).size(12.5),
+                        )
+                        .on_hover_text("Removes the .zip after a successful extraction. The extracted folder is kept.")
+                        .changed()
+                    {
+                        changed = true;
+                    }
+                    ui.add_space(4.0);
+                    let resume = "Resume interrupted downloads on launch";
+                    if ui
+                        .checkbox(
+                            &mut self.persisted.settings.resume_on_start,
+                            egui::RichText::new(resume).size(12.5),
+                        )
+                        .on_hover_text("Continue paused or interrupted downloads when the app starts.")
+                        .changed()
+                    {
+                        changed = true;
+                    }
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("Speed limit")
+                                .size(12.0)
+                                .color(MUTED),
+                        );
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.label(
+                                egui::RichText::new(if self.persisted.settings.speed_limit_kbps == 0 {
+                                    "Unlimited".to_string()
+                                } else {
+                                    format!("{} KB/s", self.persisted.settings.speed_limit_kbps)
+                                })
+                                .size(12.0)
+                                .strong()
+                                .color(accent()),
+                            );
+                            if ui
+                                .add_sized(
+                                    [190.0, 20.0],
+                                    egui::Slider::new(
+                                        &mut self.persisted.settings.speed_limit_kbps,
+                                        0..=50_000,
+                                    )
+                                    .step_by(250.0)
+                                    .show_value(false),
+                                )
+                                .changed()
+                            {
+                                changed = true;
+                            }
+                        });
+                    });
+                    ui.add_space(10.0);
+                    let scheduler = "Scheduled downloads";
+                    if ui
+                        .checkbox(
+                            &mut self.persisted.settings.scheduler_enabled,
+                            egui::RichText::new(scheduler).size(12.5),
+                        )
+                        .on_hover_text("Only start queued downloads inside this time window.")
+                        .changed()
+                    {
+                        changed = true;
+                    }
+                    if self.persisted.settings.scheduler_enabled {
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new("Window")
+                                    .size(11.5)
+                                    .color(MUTED),
+                            );
+                            ui.add(
+                                egui::DragValue::new(
+                                    &mut self.persisted.settings.schedule_start_hour,
+                                )
+                                .range(0..=23)
+                                .suffix(":00"),
+                            );
+                            ui.label(egui::RichText::new("→").size(11.5).color(DIM));
+                            ui.add(
+                                egui::DragValue::new(
+                                    &mut self.persisted.settings.schedule_end_hour,
+                                )
+                                .range(0..=23)
+                                .suffix(":00"),
+                            );
+                            ui.label(
+                                egui::RichText::new(if self.downloads.within_schedule() {
+                                    "Active now"
+                                } else {
+                                    "Waiting for the window"
+                                })
+                                .size(10.5)
+                                .color(DIM),
+                            );
+                        });
+                    }
+                });
+
+                ui.add_space(14.0);
                 settings_card(ui, self.t("appearance"), |ui| {
                     ui.label(
                         egui::RichText::new(self.t("accent-color"))
@@ -3227,6 +3832,70 @@ impl App {
                             }
                         });
                     });
+                    ui.add_space(12.0);
+                    if ui
+                        .checkbox(
+                            &mut self.persisted.settings.compact_grid,
+                            egui::RichText::new("Compact grid (covers only)").size(12.5),
+                        )
+                        .changed()
+                    {
+                        changed = true;
+                    }
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .checkbox(
+                                &mut self.persisted.settings.library_show_year,
+                                egui::RichText::new("Show year in library").size(12.0),
+                            )
+                            .changed()
+                        {
+                            changed = true;
+                        }
+                        if ui
+                            .checkbox(
+                                &mut self.persisted.settings.library_show_tags,
+                                egui::RichText::new("Show tags in library").size(12.0),
+                            )
+                            .changed()
+                        {
+                            changed = true;
+                        }
+                    });
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("UI scale")
+                                .size(12.0)
+                                .color(MUTED),
+                        );
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{:.0}%",
+                                    self.persisted.settings.ui_scale * 100.0
+                                ))
+                                .size(12.0)
+                                .strong()
+                                .color(accent()),
+                            );
+                            if ui
+                                .add_sized(
+                                    [190.0, 20.0],
+                                    egui::Slider::new(
+                                        &mut self.persisted.settings.ui_scale,
+                                        0.75..=1.75,
+                                    )
+                                    .step_by(0.05)
+                                    .show_value(false),
+                                )
+                                .changed()
+                            {
+                                changed = true;
+                            }
+                        });
+                    });
                 });
 
                 ui.add_space(14.0);
@@ -3273,6 +3942,79 @@ impl App {
                     {
                         changed = true;
                     }
+                    ui.add_space(14.0);
+                    ui.label(
+                        egui::RichText::new("RSS feeds")
+                            .size(12.5)
+                            .strong()
+                            .color(TEXT),
+                    );
+                    ui.label(
+                        egui::RichText::new(
+                            "Paste RSS or Atom feed URLs. New entries are announced in the app.",
+                        )
+                        .size(10.5)
+                        .color(DIM),
+                    );
+                    ui.add_space(6.0);
+                    let mut remove_feed: Option<String> = None;
+                    for feed in self.persisted.settings.rss_feeds.clone() {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new(ellipsize(&feed, 52))
+                                    .size(10.8)
+                                    .color(MUTED),
+                            );
+                            if theme::icon_button(ui, Icon::Close, 20.0, DIM)
+                                .on_hover_text("Remove feed")
+                                .clicked()
+                            {
+                                remove_feed = Some(feed.clone());
+                            }
+                        });
+                    }
+                    if let Some(feed) = remove_feed {
+                        self.persisted.settings.rss_feeds.retain(|item| item != &feed);
+                        changed = true;
+                    }
+                    ui.horizontal(|ui| {
+                        let width = (ui.available_width() - 110.0).max(80.0);
+                        ui.add_sized(
+                            [width, 26.0],
+                            TextEdit::singleline(&mut self.rss_draft)
+                                .hint_text("https://example.com/feed.xml"),
+                        );
+                        if theme::secondary_button(ui, "Add").clicked() {
+                            let feed = self.rss_draft.trim().to_string();
+                            if feed.starts_with("http")
+                                && !self.persisted.settings.rss_feeds.contains(&feed)
+                            {
+                                self.persisted.settings.rss_feeds.push(feed);
+                                self.rss_draft.clear();
+                                changed = true;
+                            }
+                        }
+                    });
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        if theme::secondary_button(ui, "Check feeds now").clicked() {
+                            self.check_rss_feeds();
+                            self.toast("Checking RSS feeds…", ToastTone::Info);
+                        }
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{} feed{}",
+                                self.persisted.settings.rss_feeds.len(),
+                                if self.persisted.settings.rss_feeds.len() == 1 {
+                                    ""
+                                } else {
+                                    "s"
+                                }
+                            ))
+                            .size(10.0)
+                            .color(DIM),
+                        );
+                    });
                 });
 
                 ui.add_space(14.0);
@@ -3331,8 +4073,69 @@ impl App {
                             }
                         });
                     });
+                    ui.add_space(14.0);
+                    if ui
+                        .checkbox(
+                            &mut self.persisted.settings.auto_backup,
+                            egui::RichText::new("Automatic database backup (daily, keep 10)").size(12.5),
+                        )
+                        .changed()
+                    {
+                        changed = true;
+                    }
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        let last = store::last_backup()
+                            .and_then(|path| {
+                                path.file_name()
+                                    .map(|name| name.to_string_lossy().to_string())
+                            })
+                            .unwrap_or_else(|| "No backup yet".to_string());
+                        ui.label(
+                            egui::RichText::new(format!("Last backup: {last}"))
+                                .size(10.5)
+                                .color(DIM),
+                        );
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if theme::secondary_button(ui, "Back up now").clicked() {
+                                store::backup_state();
+                                self.toast("Database backup created.", ToastTone::Success);
+                            }
+                            if theme::secondary_button(ui, "Open backups").clicked() {
+                                let dir = store::data_dir().join("backups");
+                                let _ = std::fs::create_dir_all(&dir);
+                                store::open_path(&dir);
+                            }
+                        });
+                    });
+                    ui.add_space(14.0);
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("Library cleanup")
+                                .size(12.0)
+                                .color(MUTED),
+                        );
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if theme::secondary_button(ui, "Open library").clicked() {
+                                self.set_view(View::Library);
+                            }
+                            if theme::secondary_button(ui, "Remove missing entries").clicked() {
+                                let before = self.persisted.library.len();
+                                self.persisted.library.retain(|entry| !entry.missing());
+                                let removed = before - self.persisted.library.len();
+                                self.dirty = true;
+                                self.toast(
+                                    format!(
+                                        "Removed {removed} missing library entr{}.",
+                                        if removed == 1 { "y" } else { "ies" }
+                                    ),
+                                    ToastTone::Info,
+                                );
+                            }
+                        });
+                    });
                 });
-                
+
                 ui.add_space(14.0);
                 settings_card(ui, self.t("import-export"), |ui| {
                     ui.horizontal(|ui| {
@@ -3431,6 +4234,11 @@ impl App {
                 self.persisted.settings.auto_extract,
                 self.persisted.settings.auto_retry,
                 self.persisted.settings.max_retries,
+                self.persisted.settings.delete_source_after_extract,
+                self.persisted.settings.speed_limit_kbps,
+                self.persisted.settings.scheduler_enabled,
+                self.persisted.settings.schedule_start_hour,
+                self.persisted.settings.schedule_end_hour,
             );
         }
     }
@@ -3441,22 +4249,31 @@ impl App {
         if self.toasts.is_empty() {
             return;
         }
-        let toasts: Vec<(String, ToastTone)> = self
+        let toasts: Vec<(String, ToastTone, Option<ToastAction>, f32)> = self
             .toasts
             .iter()
-            .map(|toast| (toast.text.clone(), toast.tone))
+            .map(|toast| {
+                (
+                    toast.text.clone(),
+                    toast.tone,
+                    toast.action.clone(),
+                    (toast.created.elapsed().as_secs_f32() / 0.18).min(1.0),
+                )
+            })
             .collect();
+        let mut pending: Option<ToastAction> = None;
         egui::Area::new(Id::new("toasts"))
             .anchor(Align2::RIGHT_BOTTOM, [-24.0, -92.0])
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
                 ui.set_max_width(360.0);
-                for (text, tone) in toasts.into_iter().rev() {
+                for (text, tone, action, fade) in toasts.into_iter().rev() {
                     let (dot, frame_stroke) = match tone {
                         ToastTone::Info => (accent(), accent_dim(55)),
                         ToastTone::Success => (SUCCESS, Color32::from_rgb(35, 67, 52)),
                         ToastTone::Error => (DANGER, Color32::from_rgb(76, 36, 44)),
                     };
+                    ui.set_opacity(fade);
                     Frame::none()
                         .fill(Color32::from_rgb(20, 21, 30))
                         .stroke(Stroke::new(1.0_f32, frame_stroke))
@@ -3480,12 +4297,90 @@ impl App {
                                 ui.painter().circle_filled(rect.center(), 4.0, dot);
                                 ui.add_space(2.0);
                                 ui.label(egui::RichText::new(text).size(12.0).color(TEXT));
+                                if let Some(action) = action {
+                                    if theme::small_button(ui, "Open", accent()).clicked() {
+                                        pending = Some(action);
+                                    }
+                                }
                             });
                         });
                     ui.add_space(6.0);
                 }
             });
+        if let Some(action) = pending {
+            match action {
+                ToastAction::OpenFolder(path) => store::open_path(&path),
+                ToastAction::OpenUrl(url) => {
+                    let _ = webbrowser::open(&url);
+                }
+            }
+        }
         ctx.request_repaint_after(Duration::from_millis(250));
+    }
+
+    fn draw_confirm_bulk(&mut self, ctx: &egui::Context) {
+        let Some(albums) = self.pending_bulk.clone() else {
+            return;
+        };
+        let count = albums.len();
+        let mut confirm = false;
+        let mut cancel = false;
+        egui::Window::new("Confirm bulk download")
+            .id(Id::new("confirm-bulk"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .title_bar(false)
+            .show(ctx, |ui| {
+                ui.set_min_width(340.0);
+                ui.label(
+                    egui::RichText::new(format!("Download {count} albums?"))
+                        .size(15.0)
+                        .strong()
+                        .color(TEXT),
+                );
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(
+                        "They will all be added to the download queue. Large batches can take a long time and a lot of disk space.",
+                    )
+                    .size(11.5)
+                    .color(MUTED),
+                );
+                ui.add_space(10.0);
+                for album in albums.iter().take(6) {
+                    ui.label(
+                        egui::RichText::new(format!("• {}", album.title))
+                            .size(11.0)
+                            .color(DIM),
+                    );
+                }
+                if count > 6 {
+                    ui.label(
+                        egui::RichText::new(format!("…and {} more", count - 6))
+                            .size(11.0)
+                            .color(DIM),
+                    );
+                }
+                ui.add_space(14.0);
+                ui.horizontal(|ui| {
+                    if theme::primary_button(ui, &format!("Download {count}")).clicked() {
+                        confirm = true;
+                    }
+                    if theme::small_button(ui, "Cancel", MUTED).clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if confirm {
+            self.pending_bulk = None;
+            self.enqueue_bulk(albums);
+        } else if cancel {
+            self.pending_bulk = None;
+        }
+        if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+            self.pending_bulk = None;
+        }
     }
 
     fn draw_preview(&mut self, ctx: &egui::Context) {
@@ -3843,6 +4738,7 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        ctx.set_zoom_factor(self.persisted.settings.ui_scale.clamp(0.75, 1.75));
         self.ensure_tray(ctx);
         self.handle_tray_actions(ctx);
         self.handle_close_request(ctx);
@@ -3857,6 +4753,11 @@ impl eframe::App for App {
             self.persisted.settings.auto_extract,
             self.persisted.settings.auto_retry,
             self.persisted.settings.max_retries,
+            self.persisted.settings.delete_source_after_extract,
+            self.persisted.settings.speed_limit_kbps,
+            self.persisted.settings.scheduler_enabled,
+            self.persisted.settings.schedule_start_hour,
+            self.persisted.settings.schedule_end_hour,
         );
         let notices = self.downloads.poll();
         self.handle_download_notices(notices);
@@ -3908,11 +4809,16 @@ impl eframe::App for App {
         self.poll_net();
         self.check_manual_downloads();
         self.handle_shortcuts(ctx);
+        if !self.rss_checked {
+            self.rss_checked = true;
+            self.check_rss_feeds();
+        }
 
         self.draw_sidebar(ctx);
         self.draw_detail_panel(ctx);
         self.draw_selection_bar(ctx);
         self.draw_central(ctx);
+        self.draw_confirm_bulk(ctx);
         self.draw_preview(ctx);
         self.draw_command_palette(ctx);
         self.draw_shortcuts_overlay(ctx);
@@ -3986,6 +4892,59 @@ fn toggle_format(formats: &mut FormatFilter, label: &str) {
         _ => return,
     };
     *slot = !*slot;
+}
+
+fn parse_feed_items(text: &str) -> Vec<(String, String)> {
+    let Ok(block_re) =
+        regex::Regex::new(r"(?is)<item\b[^>]*>(.*?)</item>|<entry\b[^>]*>(.*?)</entry>")
+    else {
+        return Vec::new();
+    };
+    let Ok(title_re) = regex::Regex::new(r"(?is)<title\b[^>]*>(.*?)</title>") else {
+        return Vec::new();
+    };
+    let Ok(link_re) = regex::Regex::new(r#"(?is)<link\b[^>]*href\s*=\s*"([^"]+)""#) else {
+        return Vec::new();
+    };
+    let Ok(plain_link_re) = regex::Regex::new(r"(?is)<link\b[^>]*>(.*?)</link>") else {
+        return Vec::new();
+    };
+    let mut items = Vec::new();
+    for captures in block_re.captures_iter(text) {
+        let block = captures
+            .get(1)
+            .or_else(|| captures.get(2))
+            .map(|m| m.as_str())
+            .unwrap_or_default();
+        let title = title_re
+            .captures(block)
+            .and_then(|c| c.get(1))
+            .map(|m| decode_entities(m.as_str().trim()))
+            .unwrap_or_default();
+        let link = link_re
+            .captures(block)
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str().trim().to_string())
+            .or_else(|| {
+                plain_link_re
+                    .captures(block)
+                    .and_then(|c| c.get(1))
+                    .map(|m| decode_entities(m.as_str().trim()))
+            })
+            .unwrap_or_default();
+        if !link.is_empty() {
+            items.push((title, link));
+        }
+    }
+    items
+}
+
+fn decode_entities(text: &str) -> String {
+    text.replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
 }
 
 fn ellipsize(text: &str, max_chars: usize) -> String {
@@ -4404,6 +5363,24 @@ impl SidePanelLeft {
                                 .color(DIM),
                         );
                     });
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        let current = app.i18n.language();
+                        egui::ComboBox::from_id_salt("sidebar-language")
+                            .selected_text(format!("{} {}", current.flag(), current.display_name()))
+                            .width(168.0)
+                            .show_ui(ui, |ui| {
+                                for lang in Language::all() {
+                                    let label = format!("{} {}", lang.flag(), lang.display_name());
+                                    if ui
+                                        .selectable_label(app.i18n.language() == lang, label)
+                                        .clicked()
+                                    {
+                                        app.set_language(lang);
+                                    }
+                                }
+                            });
+                    });
                     if active > 0 {
                         ui.add_space(2.0);
                         ui.horizontal(|ui| {
@@ -4448,6 +5425,7 @@ fn draw_grid(
     requests: &mut Vec<ImageSpec>,
     show_new: bool,
     footer: GridFooter<'_>,
+    compact: bool,
     id_salt: &str,
 ) -> (Vec<CardAction>, bool) {
     let avail = (ui.available_width() - 16.0).max(140.0);
@@ -4456,7 +5434,11 @@ fn draw_grid(
     let card_width = ((avail - CARD_GAP * (columns.saturating_sub(1)) as f32) / columns as f32)
         .floor()
         .max(120.0);
-    let card_height = card_width + 51.0;
+    let card_height = if compact {
+        card_width
+    } else {
+        card_width + 51.0
+    };
     let layout = CardLayout {
         columns,
         card_width,
@@ -4519,6 +5501,7 @@ fn draw_grid(
                             folders,
                             requests,
                             show_new,
+                            compact,
                         ) {
                             actions.push(action);
                         }
@@ -4548,6 +5531,7 @@ fn draw_card(
     folders: &[String],
     requests: &mut Vec<ImageSpec>,
     show_new: bool,
+    compact: bool,
 ) -> Option<CardAction> {
     let (rect, response) =
         ui.allocate_exact_size(vec2(layout.card_width, layout.card_height), Sense::click());
@@ -4786,32 +5770,34 @@ fn draw_card(
         );
     }
 
-    let text_left = rect.left() + 10.0;
-    let text_width = rect.width() - 20.0;
-    let title_y = cover.bottom() + 9.0;
-    let title_galley = painter.layout(
-        album.title.clone(),
-        FontId::new(12.8, FontFamily::Proportional),
-        TEXT,
-        text_width,
-    );
-    let title_clip = Rect::from_min_size(pos2(text_left, title_y), vec2(text_width, 34.0));
-    painter
-        .with_clip_rect(title_clip)
-        .galley(pos2(text_left, title_y), title_galley, TEXT);
-    let artist = if album.artist.trim().is_empty() {
-        "Unknown artist"
-    } else {
-        album.artist.trim()
-    };
-    let artist_text = elide_text(&painter, artist, 10.8, text_width);
-    painter.text(
-        pos2(text_left, cover.bottom() + 43.0),
-        Align2::LEFT_TOP,
-        artist_text,
-        FontId::proportional(10.8),
-        MUTED,
-    );
+    if !compact {
+        let text_left = rect.left() + 10.0;
+        let text_width = rect.width() - 20.0;
+        let title_y = cover.bottom() + 9.0;
+        let title_galley = painter.layout(
+            album.title.clone(),
+            FontId::new(12.8, FontFamily::Proportional),
+            TEXT,
+            text_width,
+        );
+        let title_clip = Rect::from_min_size(pos2(text_left, title_y), vec2(text_width, 34.0));
+        painter
+            .with_clip_rect(title_clip)
+            .galley(pos2(text_left, title_y), title_galley, TEXT);
+        let artist = if album.artist.trim().is_empty() {
+            "Unknown artist"
+        } else {
+            album.artist.trim()
+        };
+        let artist_text = elide_text(&painter, artist, 10.8, text_width);
+        painter.text(
+            pos2(text_left, cover.bottom() + 43.0),
+            Align2::LEFT_TOP,
+            artist_text,
+            FontId::proportional(10.8),
+            MUTED,
+        );
+    }
 
     response.context_menu(|ui| {
         if ui.button("Open details").clicked() {
@@ -5035,6 +6021,14 @@ fn task_row(
                         )
                         .truncate(),
                     );
+                    if let Some(host) = &task.host {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(host).size(9.5).color(DIM),
+                            )
+                            .truncate(),
+                        );
+                    }
                 });
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     let state_color = match task.state {
@@ -5052,6 +6046,17 @@ fn task_row(
                             .color(state_color),
                     );
                     ui.add_space(6.0);
+                    if task.state == DownloadState::Queued {
+                        if theme::small_button(ui, "↓", MUTED).clicked() {
+                            actions.push(TaskAction::MoveDown(task.id));
+                        }
+                        if theme::small_button(ui, "↑", MUTED).clicked() {
+                            actions.push(TaskAction::MoveUp(task.id));
+                        }
+                        if theme::small_button(ui, "First", TEXT).clicked() {
+                            actions.push(TaskAction::Prioritize(task.id));
+                        }
+                    }
                     if task.state.is_terminal() {
                         if theme::icon_button(ui, Icon::Trash, 26.0, DIM)
                             .on_hover_text("Remove from list")
@@ -5647,4 +6652,35 @@ fn shortcut_row(ui: &mut Ui, key: &str, description: &str) {
         ui.label(egui::RichText::new(description).size(11.5).color(TEXT));
     });
     ui.add_space(2.0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_feed_items;
+
+    #[test]
+    fn rss_feed_items_are_parsed() {
+        let xml = r#"<?xml version="1.0"?>
+        <rss><channel>
+          <item><title>First &amp; best</title><link>https://example.com/1</link></item>
+          <item><title>Second</title><link>https://example.com/2</link></item>
+        </channel></rss>"#;
+        let items = parse_feed_items(xml);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].0, "First & best");
+        assert_eq!(items[0].1, "https://example.com/1");
+        assert_eq!(items[1].1, "https://example.com/2");
+    }
+
+    #[test]
+    fn atom_links_with_href_are_parsed() {
+        let xml = r#"<feed>
+          <entry><title>Atom entry</title><link href="https://example.com/atom"/></entry>
+        </feed>"#;
+        let items = parse_feed_items(xml);
+        assert_eq!(items, vec![(
+            "Atom entry".to_string(),
+            "https://example.com/atom".to_string()
+        )]);
+    }
 }

@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this format.
 
+## [Unreleased]
+
+### Added
+- Download queue prioritization (`First`, `↑`, `↓`) and per-host pause/resume chips
+- Resume interrupted downloads automatically on launch (`.part` + HTTP Range)
+- Global download speed limit, optional scheduler window and source archive auto-delete
+- `Content-MD5` verification for freshly downloaded files and smarter fragment retry handling
+- Bulk download confirmation modal and library statistics/cleanup tools
+- Search filters for regex, lossless/lossy quality and availability (NEW, owned, queued)
+- Library sorting (newest, title, artist, format, size) and optional year/tags columns
+- Daily state database backups (keeps the last 10) with manual backup controls
+- Saved-search notifications, RSS/Atom feed watcher and toast action buttons
+- Compact cover-only grid, UI scale slider and language quick-switch in the sidebar
+- CLI mode: `--search`, `--latest`, `--download`, `--json`, `--help`
+- Terminal UI: `--tui` with keyboard navigation, refresh, paging and download
+- Command palette, cheat sheet, F11 fullscreen, Ctrl+Alt+P/R pause/resume and Ctrl+Alt+T accent cycling
+- External player fallback to the system handler and improved WCAG contrast for muted text
+
 ## [1.2.0] - 2026-11-06
 
 ### Added
