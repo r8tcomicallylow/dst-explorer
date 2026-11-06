@@ -73,7 +73,7 @@ fn attach_parent_console() {
     #[link(name = "kernel32")]
     extern "system" {
         fn AttachConsole(process_id: u32) -> i32;
-        fn GetStdHandle(which: u32) -> *mut std::ffi::c_void;
+        fn AllocConsole() -> i32;
         fn SetStdHandle(which: u32, handle: *mut std::ffi::c_void) -> i32;
         fn CreateFileW(
             name: *const u16,
@@ -103,38 +103,38 @@ fn attach_parent_console() {
     let inp = wide("CONIN$");
 
     unsafe {
-        if AttachConsole(ATTACH_PARENT_PROCESS) == 0 {
+        // Attach to the parent console. If that fails (for example when the
+        // app was started from Explorer) fall back to a fresh console.
+        if AttachConsole(ATTACH_PARENT_PROCESS) == 0 && AllocConsole() == 0 {
             return;
         }
-        // Only replace handles that are not already valid.
-        if GetStdHandle(STD_OUTPUT_HANDLE).is_null() {
-            let handle = CreateFileW(
-                out.as_ptr(),
-                GENERIC_READ | GENERIC_WRITE,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
-                null_mut(),
-                OPEN_EXISTING,
-                0,
-                null_mut(),
-            );
-            if handle as isize != -1 {
-                SetStdHandle(STD_OUTPUT_HANDLE, handle);
-                SetStdHandle(STD_ERROR_HANDLE, handle);
-            }
+        // Always (re)open the console devices. GUI-subsystem processes often
+        // start with invalid standard handles, and checking `is_null` is not
+        // enough: a stale handle makes crossterm read from the wrong device.
+        let out_handle = CreateFileW(
+            out.as_ptr(),
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            null_mut(),
+            OPEN_EXISTING,
+            0,
+            null_mut(),
+        );
+        if out_handle as isize != -1 {
+            SetStdHandle(STD_OUTPUT_HANDLE, out_handle);
+            SetStdHandle(STD_ERROR_HANDLE, out_handle);
         }
-        if GetStdHandle(STD_INPUT_HANDLE).is_null() {
-            let handle = CreateFileW(
-                inp.as_ptr(),
-                GENERIC_READ | GENERIC_WRITE,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
-                null_mut(),
-                OPEN_EXISTING,
-                0,
-                null_mut(),
-            );
-            if handle as isize != -1 {
-                SetStdHandle(STD_INPUT_HANDLE, handle);
-            }
+        let in_handle = CreateFileW(
+            inp.as_ptr(),
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            null_mut(),
+            OPEN_EXISTING,
+            0,
+            null_mut(),
+        );
+        if in_handle as isize != -1 {
+            SetStdHandle(STD_INPUT_HANDLE, in_handle);
         }
     }
 }

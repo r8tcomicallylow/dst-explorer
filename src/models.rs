@@ -351,6 +351,9 @@ pub struct Settings {
     pub library_show_tags: bool,
     /// RSS/Atom feeds polled for new releases.
     pub rss_feeds: Vec<String>,
+    /// MPD server host (empty disables the integration).
+    pub mpd_host: String,
+    pub mpd_port: u16,
 }
 
 impl Default for Settings {
@@ -388,6 +391,8 @@ impl Default for Settings {
             library_show_year: true,
             library_show_tags: false,
             rss_feeds: Vec::new(),
+            mpd_host: String::new(),
+            mpd_port: 6600,
         }
     }
 }

@@ -17,6 +17,9 @@ All notable changes to this project will be documented in this format.
 - Compact cover-only grid, UI scale slider and language quick-switch in the sidebar
 - CLI mode: `--search`, `--latest`, `--download`, `--json`, `--help`
 - Terminal UI: `--tui` with keyboard navigation, refresh, paging and download
+- Queue text filter and status chips (active, paused, failed, done)
+- MPD integration: optional host/port, connection test and "add folder to queue" from the library
+- Fixed TUI keyboard input in release builds by reopening `CONIN$`/`CONOUT$` after attaching to the parent console
 - Command palette, cheat sheet, F11 fullscreen, Ctrl+Alt+P/R pause/resume and Ctrl+Alt+T accent cycling
 - External player fallback to the system handler and improved WCAG contrast for muted text
 
