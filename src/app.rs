@@ -2400,6 +2400,7 @@ impl App {
             .show(ctx, |ui| {
                 ui.set_opacity(anim);
                 ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
                     let (cover_rect, cover_resp) =
                         ui.allocate_exact_size(vec2(64.0, 64.0), Sense::click());
                     let painter = ui.painter();
@@ -2437,7 +2438,7 @@ impl App {
                     }
                     ui.add_space(8.0);
                     ui.allocate_ui_with_layout(
-                        vec2(200.0, 64.0),
+                        vec2(160.0, 64.0),
                         Layout::top_down(Align::LEFT),
                         |ui| {
                             ui.add_space(6.0);
@@ -2447,7 +2448,7 @@ impl App {
                                 .map(|title| title.to_string())
                                 .unwrap_or_else(|| "Audio".to_string());
                             ui.label(
-                                egui::RichText::new(elide_text(ui.painter(), &title, 12.5, 192.0))
+                                egui::RichText::new(elide_text(ui.painter(), &title, 12.5, 152.0))
                                     .size(12.5)
                                     .strong()
                                     .color(TEXT()),
@@ -2458,7 +2459,7 @@ impl App {
                                         ui.painter(),
                                         error,
                                         10.0,
-                                        192.0,
+                                        152.0,
                                     ))
                                     .size(10.0)
                                     .color(DANGER()),
@@ -2536,8 +2537,11 @@ impl App {
                     }
                     ui.add_space(8.0);
 
-                    let time_width = 96.0;
-                    let wave_width = (ui.available_width() - time_width - 118.0).max(60.0);
+                    // The time label lives inside the right-hand cluster; keeping
+                    // it there means it can never be overlapped by the volume
+                    // slider, no matter how narrow the player bar gets.
+                    let controls_width = 210.0;
+                    let wave_width = (ui.available_width() - controls_width - 16.0).max(60.0);
                     let wave_height = 44.0;
                     let cursor = ui.cursor().left_top();
                     let wave_rect = Rect::from_min_size(cursor, vec2(wave_width, wave_height));
@@ -2586,17 +2590,8 @@ impl App {
                         ctx.request_repaint_after(Duration::from_millis(100));
                     }
                     ui.add_space(6.0);
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "{} / {}",
-                            track_time(shown_position),
-                            track_time(duration)
-                        ))
-                        .size(10.0)
-                        .color(DIM()),
-                    );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if theme::icon_button(ui, Icon::Close, 28.0, MUTED())
+                        if theme::icon_button(ui, Icon::Close, 26.0, MUTED())
                             .on_hover_text("Stop")
                             .clicked()
                         {
@@ -2604,7 +2599,7 @@ impl App {
                         }
                         if ui
                             .add_sized(
-                                [84.0, 18.0],
+                                [64.0, 18.0],
                                 egui::Slider::new(
                                     &mut self.persisted.settings.audio_volume,
                                     0.0..=1.0,
@@ -2616,17 +2611,22 @@ impl App {
                             self.player.set_volume(self.persisted.settings.audio_volume);
                             self.dirty = true;
                         }
-                        theme::paint_icon(
-                            ui.painter(),
-                            Rect::from_center_size(
-                                pos2(ui.cursor().left() + 8.0, ui.cursor().center().y),
-                                vec2(14.0, 14.0),
-                            ),
-                            Icon::Volume,
-                            DIM(),
-                            1.3,
+                        ui.add_space(2.0);
+                        let icon_rect = Rect::from_center_size(
+                            pos2(ui.cursor().left() + 7.0, ui.cursor().center().y),
+                            vec2(14.0, 14.0),
                         );
-                        ui.add_space(18.0);
+                        theme::paint_icon(ui.painter(), icon_rect, Icon::Volume, DIM(), 1.3);
+                        ui.add_space(16.0);
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{} / {}",
+                                track_time(shown_position),
+                                track_time(duration)
+                            ))
+                            .size(10.0)
+                            .color(DIM()),
+                        );
                     });
                 });
             });
@@ -3895,7 +3895,10 @@ impl App {
                             ui.horizontal(|ui| {
                                 let (cover, cover_response) =
                                     ui.allocate_exact_size(vec2(56.0, 56.0), Sense::click());
-                                let key = format!("t{}", entry.album.id);
+                                // Separate key from the grid (which uses "t{id}" at a
+                                // larger size) so a small library thumbnail can't poison
+                                // the shared texture cache with a blurry image.
+                                let key = format!("tl{}", entry.album.id);
                                 if let Some(texture) = textures.get(&key) {
                                     paint_texture_cover(
                                         ui.painter(),
@@ -4013,7 +4016,7 @@ impl App {
                                             } else if entry.warning.is_some() {
                                                 theme::badge(
                                                     ui,
-                                                    "WARNING()",
+                                                    "WARNING",
                                                     WARNING(),
                                                     Color32::from_rgb(38, 32, 20),
                                                 );
