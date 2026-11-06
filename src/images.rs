@@ -11,6 +11,9 @@ use eframe::egui;
 
 use crate::api::USER_AGENT;
 
+/// Hard cap on the approximate decoded-texture memory kept alive.
+pub const TEXTURE_BYTE_BUDGET: usize = 20 * 1024 * 1024;
+
 #[derive(Clone, Debug)]
 pub struct ImageSpec {
     pub key: String,
@@ -42,12 +45,27 @@ impl ImageLoader {
         let (req_tx, req_rx) = unbounded::<ImageRequest>();
         let (res_tx, res_rx) = unbounded::<Result<DecodedImage, String>>();
         let worker_count = workers.max(2);
+        // One shared client (cheap Arc clone) instead of one per worker: each
+        // separate client keeps its own connection pool and TLS state.
+        let client = match reqwest::blocking::Client::builder()
+            .user_agent(USER_AGENT)
+            .timeout(Duration::from_secs(25))
+            .connect_timeout(Duration::from_secs(10))
+            .build()
+        {
+            Ok(client) => Some(client),
+            Err(err) => {
+                eprintln!("Could not build image client: {err}");
+                None
+            }
+        };
         for index in 0..worker_count {
             let rx = req_rx.clone();
             let tx = res_tx.clone();
+            let client = client.clone();
             let _ = thread::Builder::new()
                 .name(format!("image-worker-{index}"))
-                .spawn(move || image_worker(rx, tx));
+                .spawn(move || image_worker(rx, tx, client));
         }
         Self {
             tx: req_tx,
@@ -112,18 +130,13 @@ impl ImageLoader {
     }
 }
 
-fn image_worker(rx: Receiver<ImageRequest>, tx: Sender<Result<DecodedImage, String>>) {
-    let client = reqwest::blocking::Client::builder()
-        .user_agent(USER_AGENT)
-        .timeout(Duration::from_secs(25))
-        .connect_timeout(Duration::from_secs(10))
-        .build();
-    let client = match client {
-        Ok(client) => client,
-        Err(err) => {
-            eprintln!("Could not build image client: {err}");
-            return;
-        }
+fn image_worker(
+    rx: Receiver<ImageRequest>,
+    tx: Sender<Result<DecodedImage, String>>,
+    client: Option<reqwest::blocking::Client>,
+) {
+    let Some(client) = client else {
+        return;
     };
 
     while let Ok(request) = rx.recv() {
@@ -194,11 +207,14 @@ struct TexEntry {
     handle: egui::TextureHandle,
     last_used: u64,
     inserted: Instant,
+    /// Approximate VRAM/RAM footprint of the decoded RGBA texture.
+    bytes: usize,
 }
 
 pub struct Textures {
     entries: HashMap<String, TexEntry>,
     frame: u64,
+    reported: (usize, usize),
 }
 
 impl Default for Textures {
@@ -206,6 +222,7 @@ impl Default for Textures {
         Self {
             entries: HashMap::new(),
             frame: 0,
+            reported: (0, 0),
         }
     }
 }
@@ -216,12 +233,15 @@ impl Textures {
     }
 
     pub fn insert(&mut self, key: String, handle: egui::TextureHandle) {
+        let [width, height] = handle.size();
+        let bytes = width.saturating_mul(height).saturating_mul(4);
         self.entries.insert(
             key,
             TexEntry {
                 handle,
                 last_used: self.frame,
                 inserted: Instant::now(),
+                bytes,
             },
         );
     }
@@ -245,20 +265,52 @@ impl Textures {
     }
 
     /// Drop least-recently-used textures so scrolling many pages can't grow memory without bound.
-    pub fn trim(&mut self, budget: usize) {
-        if self.entries.len() <= budget {
+    ///
+    /// Two independent limits are enforced: a maximum entry count and a maximum
+    /// approximate byte size (decoded RGBA). The byte cap is what really keeps
+    /// RAM in check, since a single 900px cover costs ~3 MB.
+    pub fn trim(&mut self, budget: usize, max_bytes: usize) {
+        let total_bytes: usize = self.entries.values().map(|entry| entry.bytes).sum();
+        self.report(total_bytes);
+
+        if self.entries.len() <= budget && total_bytes <= max_bytes {
             return;
         }
+
         let target = budget.saturating_sub(budget / 6).max(50);
+        let byte_target = max_bytes.saturating_sub(max_bytes / 6);
         let mut ages: Vec<(String, u64)> = self
             .entries
             .iter()
             .map(|(key, entry)| (key.clone(), entry.last_used))
             .collect();
         ages.sort_by_key(|(_, age)| *age);
-        let remove_count = self.entries.len().saturating_sub(target);
-        for (key, _) in ages.into_iter().take(remove_count) {
-            self.entries.remove(&key);
+        let mut remaining_bytes = total_bytes;
+        for (key, _) in ages {
+            if self.entries.len() <= target && remaining_bytes <= byte_target {
+                break;
+            }
+            if let Some(entry) = self.entries.remove(&key) {
+                remaining_bytes = remaining_bytes.saturating_sub(entry.bytes);
+            }
+        }
+        self.report(remaining_bytes);
+    }
+
+    fn report(&mut self, total_bytes: usize) {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        if !*ENABLED.get_or_init(|| std::env::var_os("DST_TEX_STATS").is_some()) {
+            return;
+        }
+        let stats = (self.entries.len(), total_bytes);
+        if stats != self.reported {
+            self.reported = stats;
+            eprintln!(
+                "textures: {} entries, {:.2} MB",
+                stats.0,
+                stats.1 as f64 / (1024.0 * 1024.0)
+            );
         }
     }
 }

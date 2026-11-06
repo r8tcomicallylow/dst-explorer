@@ -59,6 +59,9 @@ fn migrate_state(state: &mut Persisted) {
         // default. Bump the version so future migrations can rely on it.
         state.version = STATE_VERSION;
     }
+    // Keep the texture cache bounded even when a stale config still contains
+    // the old 700+ default.
+    state.settings.texture_budget = state.settings.texture_budget.clamp(60, 400);
 }
 
 pub fn save_state(state: &Persisted) {

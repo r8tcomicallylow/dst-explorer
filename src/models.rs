@@ -385,7 +385,7 @@ impl Default for Settings {
             accent: 0,
             show_new_badges: true,
             confirm_bulk: false,
-            texture_budget: 700,
+            texture_budget: 160,
             search_sort: SearchSort::Default,
             notify_on_complete: true,
             show_tray_icon: true,

@@ -80,24 +80,27 @@ pub struct I18n {
 
 impl I18n {
     pub fn new() -> Self {
+        // Only the fallback bundle is parsed up front. Other languages are
+        // loaded lazily on first use to keep idle memory (and startup time) low.
+        let bundle = load_bundle(Language::English)
+            .unwrap_or_else(|| FluentBundle::new(vec!["en-US".parse().unwrap()]));
         let mut bundles = HashMap::new();
-        for lang in Language::all() {
-            if let Some(bundle) = load_bundle(lang.clone()) {
-                bundles.insert(lang, Arc::new(bundle));
-            }
-        }
-        // Always ensure English exists as fallback
-        if !bundles.contains_key(&Language::English) {
-            let bundle = FluentBundle::new(vec!["en-US".parse().unwrap()]);
-            bundles.insert(Language::English, Arc::new(bundle));
-        }
+        bundles.insert(Language::English, Arc::new(bundle));
         Self {
             bundles: RwLock::new(bundles),
-            current: RwLock::new(Language::default()),
+            current: RwLock::new(Language::English),
         }
     }
 
     pub fn set_language(&self, lang: Language) {
+        if lang != Language::English {
+            let mut bundles = self.bundles.write().unwrap();
+            if !bundles.contains_key(&lang) {
+                if let Some(bundle) = load_bundle(lang.clone()) {
+                    bundles.insert(lang.clone(), Arc::new(bundle));
+                }
+            }
+        }
         *self.current.write().unwrap() = lang;
     }
 

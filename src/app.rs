@@ -510,7 +510,7 @@ impl App {
             search: SearchState::default(),
             detail: None,
             selection: HashSet::new(),
-            images: ImageLoader::new(6),
+            images: ImageLoader::new(2),
             textures: Textures::default(),
             downloads,
             dl_ui: DownloadUiState {
@@ -2582,8 +2582,7 @@ impl App {
                         .map(|fraction| fraction * duration)
                         .unwrap_or_else(|| self.player.position());
                     // Keep redrawing while dragging / playing so the playhead stays smooth.
-                    if response.hovered() || self.player.is_playing() || self.scrub_fraction.is_some()
-                    {
+                    if response.hovered() || self.player.is_playing() || self.scrub_fraction.is_some() {
                         ctx.request_repaint_after(Duration::from_millis(100));
                     }
                     ui.add_space(6.0);
@@ -2637,7 +2636,7 @@ impl App {
                     key: format!("t{}", album.id),
                     url: album.thumb_url(),
                     cache_path: store::thumb_cache_path(album.id),
-                    max_dim: 420,
+                    max_dim: 288,
                 }]);
             }
         }
@@ -3916,7 +3915,7 @@ impl App {
                                         key: key.clone(),
                                         url: entry.album.thumb_url(),
                                         cache_path: store::thumb_cache_path(entry.album.id),
-                                        max_dim: 220,
+                                        max_dim: 160,
                                     });
                                 }
                                 if cover_response.clicked() {
@@ -4888,9 +4887,9 @@ impl App {
                                     [190.0, 20.0],
                                     egui::Slider::new(
                                         &mut self.persisted.settings.texture_budget,
-                                        200..=1600,
+                                        60..=400,
                                     )
-                                    .step_by(50.0)
+                                    .step_by(20.0)
                                     .show_value(false),
                                 )
                                 .changed()
@@ -6131,7 +6130,10 @@ impl eframe::App for App {
         self.draw_confetti(ctx);
 
         self.images.pump(ctx, &mut self.textures, 4);
-        self.textures.trim(self.persisted.settings.texture_budget);
+        self.textures.trim(
+            self.persisted.settings.texture_budget,
+            crate::images::TEXTURE_BYTE_BUDGET,
+        );
 
         // Remember the last played track so it can be resumed on the next launch.
         if self.persisted.settings.remember_position
@@ -7013,7 +7015,7 @@ fn draw_card(
             key: key.clone(),
             url: album.thumb_url(),
             cache_path: store::thumb_cache_path(album.id),
-            max_dim: 420,
+            max_dim: 288,
         });
     }
 
@@ -7891,7 +7893,7 @@ fn draw_detail(
                     key: cover_key.clone(),
                     url: album.cover_url(),
                     cache_path: store::cover_cache_path(album.id),
-                    max_dim: 900,
+                    max_dim: 640,
                 });
             }
             if cover_response.hovered() {
