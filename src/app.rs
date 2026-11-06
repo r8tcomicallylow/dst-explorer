@@ -2049,21 +2049,26 @@ impl App {
                     let time_width = 96.0;
                     let wave_width = (ui.available_width() - time_width - 118.0).max(60.0);
                     let wave_height = 44.0;
-                    let (rect, response) =
-                        ui.allocate_exact_size(vec2(wave_width, wave_height), Sense::click_and_drag());
+                    let cursor = ui.cursor().left_top();
+                    let wave_rect = Rect::from_min_size(cursor, vec2(wave_width, wave_height));
+                    let response = ui.allocate_rect(wave_rect, Sense::click_and_drag());
                     let peaks = self
                         .player
                         .waveform()
                         .map(|waveform| waveform.peaks.clone())
                         .unwrap_or_default();
                     let progress = self.player.progress();
-                    paint_waveform(ui.painter(), rect, &peaks, progress);
+                    paint_waveform(ui.painter(), wave_rect, &peaks, progress);
                     if response.clicked() || response.dragged() {
                         if let Some(position) = response.interact_pointer_pos() {
                             let fraction =
-                                ((position.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+                                ((position.x - wave_rect.left()) / wave_rect.width()).clamp(0.0, 1.0);
                             self.player.set_position_fraction(fraction);
                         }
+                    }
+                    // Keep redrawing while dragging / playing so the playhead stays smooth.
+                    if response.hovered() || self.player.is_playing() {
+                        ctx.request_repaint_after(Duration::from_millis(100));
                     }
                     ui.add_space(6.0);
                     ui.label(
