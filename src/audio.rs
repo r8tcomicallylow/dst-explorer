@@ -463,7 +463,10 @@ impl AudioPlayer {
         let Some(sink) = &self.sink else {
             return Ok(());
         };
-        sink.try_seek(Duration::from_secs_f32(target))
+        // `try_seek` works on the whole sink timeline. After a gapless
+        // transition the current track starts at `track_offset`, so the
+        // requested track-relative position has to be shifted by it.
+        sink.try_seek(Duration::from_secs_f32(self.track_offset + target))
             .map_err(|error| format!("Seek failed: {error}"))
     }
 
