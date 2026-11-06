@@ -39,6 +39,11 @@ All notable changes to this project will be documented in this format.
 ### Changed
 - Player queue handling now resets prefetch state correctly when shuffle, repeat or resume changes
 
+### Fixed
+- UI scale slider no longer jumps back and forth; zoom is applied when the drag ends
+- Waveform scrubbing previews the position while dragging and seeks once on release
+- Seeking after a gapless track transition now uses the correct offset inside the sink
+
 ## [1.2.0] - 2026-11-06
 
 ### Added

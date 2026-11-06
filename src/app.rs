@@ -469,6 +469,8 @@ pub struct App {
     confetti: Option<(Instant, Vec<Confetti>)>,
     resume_saved: Instant,
     tray_tooltip_at: Instant,
+    scale_dragging: bool,
+    scrub_fraction: Option<f32>,
 }
 
 impl App {
@@ -571,6 +573,8 @@ impl App {
             confetti: None,
             resume_saved: Instant::now(),
             tray_tooltip_at: Instant::now(),
+            scale_dragging: false,
+            scrub_fraction: None,
         };
         app.refresh_latest();
         app.sync_library_from_downloads();
@@ -2543,25 +2547,51 @@ impl App {
                         .waveform()
                         .map(|waveform| waveform.peaks.clone())
                         .unwrap_or_default();
-                    let progress = self.player.progress();
-                    paint_waveform(ui.painter(), wave_rect, &peaks, progress);
-                    if response.clicked() || response.dragged() {
-                        if let Some(position) = response.interact_pointer_pos() {
-                            let fraction = ((position.x - wave_rect.left()) / wave_rect.width())
-                                .clamp(0.0, 1.0);
+                    let duration = self.player.duration();
+                    let pointer_fraction = (response.dragged() || response.clicked())
+                        .then(|| response.interact_pointer_pos())
+                        .flatten()
+                        .map(|position| {
+                            ((position.x - wave_rect.left()) / wave_rect.width()).clamp(0.0, 1.0)
+                        });
+
+                    // While dragging, only move the visual playhead. The actual seek
+                    // happens once on release, which avoids rebuilding the audio
+                    // sink dozens of times per second and stops the slider jumping.
+                    if response.dragged() {
+                        self.scrub_fraction = pointer_fraction;
+                    }
+                    if response.drag_stopped() {
+                        if let Some(fraction) = self.scrub_fraction.take() {
                             self.player.set_position_fraction(fraction);
                         }
                     }
+                    if response.clicked() {
+                        if let Some(fraction) = pointer_fraction {
+                            self.player.set_position_fraction(fraction);
+                            self.scrub_fraction = None;
+                        }
+                    }
+
+                    let progress = self
+                        .scrub_fraction
+                        .unwrap_or_else(|| self.player.progress());
+                    paint_waveform(ui.painter(), wave_rect, &peaks, progress);
+                    let shown_position = self
+                        .scrub_fraction
+                        .map(|fraction| fraction * duration)
+                        .unwrap_or_else(|| self.player.position());
                     // Keep redrawing while dragging / playing so the playhead stays smooth.
-                    if response.hovered() || self.player.is_playing() {
+                    if response.hovered() || self.player.is_playing() || self.scrub_fraction.is_some()
+                    {
                         ctx.request_repaint_after(Duration::from_millis(100));
                     }
                     ui.add_space(6.0);
                     ui.label(
                         egui::RichText::new(format!(
                             "{} / {}",
-                            track_time(self.player.position()),
-                            track_time(self.player.duration())
+                            track_time(shown_position),
+                            track_time(duration)
                         ))
                         .size(10.0)
                         .color(DIM()),
@@ -4917,18 +4947,19 @@ impl App {
                                 .strong()
                                 .color(accent()),
                             );
-                            if ui
-                                .add_sized(
-                                    [190.0, 20.0],
-                                    egui::Slider::new(
-                                        &mut self.persisted.settings.ui_scale,
-                                        0.75..=1.75,
-                                    )
+                            let slider = ui.add_sized(
+                                [190.0, 20.0],
+                                egui::Slider::new(&mut self.persisted.settings.ui_scale, 0.75..=1.75)
                                     .step_by(0.05)
                                     .show_value(false),
-                                )
-                                .changed()
-                            {
+                            );
+                            if slider.drag_started() {
+                                self.scale_dragging = true;
+                            }
+                            if slider.drag_stopped() {
+                                self.scale_dragging = false;
+                            }
+                            if slider.changed() {
                                 changed = true;
                             }
                         });
@@ -5984,7 +6015,11 @@ impl eframe::App for App {
             ctx.copy_text(text);
             self.toast("Copied to clipboard.", ToastTone::Success);
         }
-        ctx.set_zoom_factor(self.persisted.settings.ui_scale.clamp(0.75, 1.75));
+        // Applying zoom while the slider is being dragged moves the widget under
+        // the pointer, which made the value oscillate. Apply it once on release.
+        if !self.scale_dragging {
+            ctx.set_zoom_factor(self.persisted.settings.ui_scale.clamp(0.75, 1.75));
+        }
         self.ensure_tray(ctx);
         self.handle_tray_actions(ctx);
         if self.tray.is_some() && self.tray_tooltip_at.elapsed() > Duration::from_secs(3) {
