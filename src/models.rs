@@ -324,6 +324,7 @@ pub struct Settings {
     pub foobar2000_path: Option<PathBuf>,
     pub auto_retry: bool,
     pub max_retries: usize,
+    pub language: String,
 }
 
 impl Default for Settings {
@@ -346,6 +347,7 @@ impl Default for Settings {
             foobar2000_path: None,
             auto_retry: true,
             max_retries: 3,
+            language: "en-US".to_string(),
         }
     }
 }

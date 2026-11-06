@@ -4,6 +4,7 @@ mod api;
 mod app;
 mod downloads;
 mod images;
+mod i18n;
 mod models;
 mod persist;
 mod store;

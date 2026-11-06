@@ -165,13 +165,13 @@ fn visuals() -> egui::Visuals {
     visuals
 }
 
-pub fn primary_button(ui: &mut egui::Ui, text: &str) -> Response {
+pub fn primary_button(ui: &mut egui::Ui, text: impl Into<String>) -> Response {
     primary_button_w(ui, text, 0.0)
 }
 
-pub fn primary_button_w(ui: &mut egui::Ui, text: &str, width: f32) -> Response {
+pub fn primary_button_w(ui: &mut egui::Ui, text: impl Into<String>, width: f32) -> Response {
     let button = egui::Button::new(
-        egui::RichText::new(text)
+        egui::RichText::new(text.into())
             .size(13.0)
             .strong()
             .color(Color32::from_rgb(14, 15, 21)),
@@ -183,8 +183,8 @@ pub fn primary_button_w(ui: &mut egui::Ui, text: &str, width: f32) -> Response {
     ui.add(button)
 }
 
-pub fn small_button(ui: &mut egui::Ui, text: &str, tint: Color32) -> Response {
-    let button = egui::Button::new(egui::RichText::new(text).size(11.0).color(tint))
+pub fn small_button(ui: &mut egui::Ui, text: impl Into<String>, tint: Color32) -> Response {
+    let button = egui::Button::new(egui::RichText::new(text.into()).size(11.0).color(tint))
         .fill(CARD)
         .stroke(Stroke::new(1.0_f32, BORDER_SOFT))
         .rounding(Rounding::same(7.0))
@@ -192,8 +192,8 @@ pub fn small_button(ui: &mut egui::Ui, text: &str, tint: Color32) -> Response {
     ui.add(button)
 }
 
-pub fn secondary_button(ui: &mut egui::Ui, text: &str) -> Response {
-    let button = egui::Button::new(egui::RichText::new(text).size(13.0).color(TEXT))
+pub fn secondary_button(ui: &mut egui::Ui, text: impl Into<String>) -> Response {
+    let button = egui::Button::new(egui::RichText::new(text.into()).size(13.0).color(TEXT))
         .fill(CARD)
         .stroke(Stroke::new(1.0_f32, BORDER))
         .rounding(Rounding::same(9.0))
@@ -201,7 +201,8 @@ pub fn secondary_button(ui: &mut egui::Ui, text: &str) -> Response {
     ui.add(button)
 }
 
-pub fn chip(ui: &mut egui::Ui, text: &str, selected: bool) -> Response {
+pub fn chip(ui: &mut egui::Ui, text: impl Into<String>, selected: bool) -> Response {
+    let text = text.into();
     let color = if selected {
         Color32::from_rgb(14, 15, 21)
     } else {
@@ -209,7 +210,7 @@ pub fn chip(ui: &mut egui::Ui, text: &str, selected: bool) -> Response {
     };
     let galley = ui
         .painter()
-        .layout_no_wrap(text.to_string(), FontId::proportional(12.0), color);
+        .layout_no_wrap(text, FontId::proportional(12.0), color);
     let size = vec2(galley.size().x + 22.0, 29.0);
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
     let hovered = response.hovered();

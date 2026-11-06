@@ -2,6 +2,27 @@
 
 All notable changes to this project will be documented in this format.
 
+## [1.2.0] - 2026-11-06
+
+### Added
+- Five interface languages: English, German, French, Chinese and Japanese, with flag emoji selectors in Settings
+- Automatic language detection via `DST_EXPLORER_LANG` (falls back to the saved setting)
+- Fluent (`.ftl`) based localization bundled into the binary, so the portable build stays self-contained
+- Localized sidebar navigation, page headers and the whole Settings screen
+- Locale parity tests that fail the build when a translation key is missing
+
+### Changed
+- `theme` widget helpers now accept any string type, making localized labels ergonomic
+
+## [1.1.0] - 2026-11-06
+
+### Added
+- Auto-retry of failed downloads with exponential backoff (only for temporary errors)
+- Windows taskbar progress reporting and an "All downloads complete" notification
+- Import/Export of settings, watchlist, library, watch folders and auto-save rules as JSON
+- Library filters: format, year and instant text search
+- Dynamic version label in the sidebar and About card
+
 ## [1.0.0] - 2026-10-27
 
 ### Added

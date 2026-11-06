@@ -12,6 +12,7 @@ use eframe::egui::{
 use crate::api::{self, FeedPage, SearchParams};
 use crate::downloads::{DownloadManager, DownloadNotice, DownloadState};
 use crate::images::{ImageLoader, ImageSpec, Textures};
+use crate::i18n::{negotiate_best_language, I18n, Language};
 use crate::models::{
     sort_albums, Album, AlbumDetail, FormatFilter, LibraryEntry, Persisted, RuleField, SaveRule,
     SearchKind, SearchSort, WatchMeta,
@@ -241,6 +242,7 @@ pub struct App {
     tray_hint_shown: bool,
     allow_exit: bool,
     rule_draft: Option<RuleDraft>,
+    i18n: I18n,
 
     net_tx: Sender<NetEvent>,
     net_rx: Receiver<NetEvent>,
@@ -316,6 +318,7 @@ impl App {
             tray_hint_shown: false,
             allow_exit: false,
             rule_draft: None,
+            i18n: I18n::new(),
             net_tx,
             net_rx,
             toasts: Vec::new(),
@@ -344,6 +347,12 @@ impl App {
         };
         app.refresh_latest();
         app.sync_library_from_downloads();
+        // Apply language from settings, allowing an env override for testing.
+        let lang = match std::env::var("DST_EXPLORER_LANG") {
+            Ok(value) if !value.trim().is_empty() => negotiate_best_language(&[value]),
+            _ => Language::from_locale(&app.persisted.settings.language),
+        };
+        app.i18n.set_language(lang);
         if app.downloads.restored_paused > 0 {
             let count = app.downloads.restored_paused;
             app.toast(
@@ -355,6 +364,16 @@ impl App {
             );
         }
         app
+    }
+
+    fn set_language(&mut self, lang: Language) {
+        self.i18n.set_language(lang);
+        self.persisted.settings.language = lang.locale_id().to_string();
+        self.dirty = true;
+    }
+
+    fn t(&self, key: &str) -> String {
+        self.i18n.t(key, None)
     }
 
     fn ensure_tray(&mut self, ctx: &egui::Context) {
@@ -1572,19 +1591,19 @@ impl App {
         let loaded = self.latest.len();
         view_header(
             ui,
-            "LATEST RELEASES",
-            "Fresh from the archive",
-            "New doujin albums, updated as they are added to DoujinStyle.",
+            self.t("discover-eyebrow"),
+            self.t("discover-title"),
+            self.t("discover-desc"),
             |ui| {
                 if theme::icon_button(ui, Icon::Refresh, 36.0, MUTED)
-                    .on_hover_text("Refresh releases (Ctrl+R)")
+                    .on_hover_text(self.t("refresh-hover"))
                     .clicked()
                 {
                     self.refresh_latest();
                 }
                 if loaded > 0 {
                     ui.label(
-                        egui::RichText::new(format!("{loaded} loaded"))
+                        egui::RichText::new(format!("{} {}", loaded, self.t("loaded")))
                             .size(11.0)
                             .color(DIM),
                     );
@@ -1724,7 +1743,7 @@ impl App {
                         .add_sized(
                             [button_width, 38.0],
                             egui::Button::new(
-                                egui::RichText::new("Search")
+                                egui::RichText::new(self.t("search-button"))
                                     .size(13.0)
                                     .strong()
                                     .color(Color32::from_rgb(14, 15, 21)),
@@ -2111,26 +2130,22 @@ impl App {
             .iter()
             .filter(|album| !self.persisted.watch_note_of(album.id).trim().is_empty())
             .count();
-        let plural = if total == 1 { "" } else { "s" };
         let subtitle = if total == 0 {
-            "No albums saved yet".to_string()
+            self.t("watchlist-empty")
         } else {
             let mut text = if visible.len() == total {
-                format!("{total} album{plural} saved")
+                format!("{total} {}", self.t("albums-word"))
             } else {
-                format!("{} of {total} album{plural} in this folder", visible.len())
+                format!("{} / {total} {}", visible.len(), self.t("albums-word"))
             };
             if note_count > 0 {
-                text.push_str(&format!(
-                    " · {note_count} note{}",
-                    if note_count == 1 { "" } else { "s" }
-                ));
+                text.push_str(&format!(" · {note_count} ✎"));
             }
             text
         };
         let mut add_folder = false;
         let download_albums = visible.clone();
-        view_header(ui, "COLLECTION", "Your watchlist", &subtitle, |ui| {
+        view_header(ui, self.t("collection"), self.t("watchlist-title"), subtitle, |ui| {
             if !download_albums.is_empty() {
                 let label = if download_albums.len() == total {
                     "Download all"
@@ -2367,13 +2382,13 @@ impl App {
         let count = self.persisted.library.len();
         let total: u64 = self.persisted.library.iter().map(|entry| entry.size).sum();
         let subtitle = format!(
-            "{} album{} · {} on disk",
+            "{} {} · {}",
             count,
-            if count == 1 { "" } else { "s" },
+            self.t("albums-word"),
             store::human_size(total)
         );
-        view_header(ui, "COLLECTION", "Your library", &subtitle, |ui| {
-            if theme::secondary_button(ui, "Open downloads folder").clicked() {
+        view_header(ui, self.t("collection"), self.t("library-title"), subtitle, |ui| {
+            if theme::secondary_button(ui, self.t("open-downloads-folder")).clicked() {
                 let dir = self.persisted.settings.download_dir.clone();
                 let _ = std::fs::create_dir_all(&dir);
                 store::open_path(&dir);
@@ -2708,18 +2723,18 @@ impl App {
         let paused = self.downloads.paused_count();
         let failed = self.downloads.failed_count();
         let mut parts = vec![
-            format!("{active} active"),
-            format!("{} queued", self.downloads.queued_count()),
+            format!("{active} {}", self.t("active-word")),
+            format!("{} {}", self.downloads.queued_count(), self.t("queued")),
         ];
         if paused > 0 {
-            parts.push(format!("{paused} paused"));
+            parts.push(format!("{paused} {}", self.t("paused")));
         }
         if failed > 0 {
-            parts.push(format!("{failed} failed"));
+            parts.push(format!("{failed} {}", self.t("failed")));
         }
-        parts.push(format!("{} total", self.downloads.tasks.len()));
+        parts.push(format!("{} {}", self.downloads.tasks.len(), self.t("total-word")));
         let subtitle = parts.join(" · ");
-        view_header(ui, "TRANSFERS", "Download queue", &subtitle, |ui| {
+        view_header(ui, self.t("downloads-eyebrow"), self.t("downloads-title"), subtitle, |ui| {
             let running = self.downloads.running_count();
             let paused = self.downloads.paused_count();
             let failed = self.downloads.failed_count();
@@ -2808,14 +2823,14 @@ impl App {
         let mut cancel_rule = false;
         let mut draft = self.rule_draft.take();
         ui.label(
-            egui::RichText::new("PREFERENCES")
+            egui::RichText::new(self.t("preferences"))
                 .size(10.5)
                 .strong()
                 .color(accent()),
         );
         ui.add_space(3.0);
         ui.label(
-            egui::RichText::new("Settings")
+            egui::RichText::new(self.t("settings"))
                 .font(FontId::new(27.0, FontFamily::Proportional))
                 .strong()
                 .color(TEXT),
@@ -2826,9 +2841,9 @@ impl App {
             .id_salt("settings-scroll")
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                settings_card(ui, "Downloads", |ui| {
+                settings_card(ui, self.t("downloads"), |ui| {
                     ui.label(
-                        egui::RichText::new("Save location")
+                        egui::RichText::new(self.t("save-location"))
                             .size(12.0)
                             .color(MUTED),
                     );
@@ -2856,9 +2871,9 @@ impl App {
                                     .truncate(),
                                 );
                             });
-                        if theme::small_button(ui, "Change…", TEXT).clicked() {
+                        if theme::small_button(ui, self.t("browse"), TEXT).clicked() {
                             if let Some(folder) = rfd::FileDialog::new()
-                                .set_title("Choose a download folder")
+                                .set_title(self.t("choose-download-folder"))
                                 .set_directory(&self.persisted.settings.download_dir)
                                 .pick_folder()
                             {
@@ -2866,7 +2881,7 @@ impl App {
                                 changed = true;
                             }
                         }
-                        if theme::small_button(ui, "Open", TEXT).clicked() {
+                        if theme::small_button(ui, self.t("open"), TEXT).clicked() {
                             let dir = self.persisted.settings.download_dir.clone();
                             let _ = std::fs::create_dir_all(&dir);
                             store::open_path(&dir);
@@ -2875,7 +2890,7 @@ impl App {
                     ui.add_space(16.0);
                     ui.horizontal(|ui| {
                         ui.label(
-                            egui::RichText::new("Simultaneous downloads")
+                            egui::RichText::new(self.t("simultaneous-downloads"))
                                 .size(12.0)
                                 .color(MUTED),
                         );
@@ -2904,10 +2919,11 @@ impl App {
                         });
                     });
                     ui.add_space(12.0);
+                    let auto_extract_label = self.t("auto-extract");
                     if ui
                         .checkbox(
                             &mut self.persisted.settings.auto_extract,
-                            egui::RichText::new("Automatically extract ZIP archives")
+                            egui::RichText::new(auto_extract_label)
                                 .size(12.5),
                         )
                         .changed()
@@ -2917,7 +2933,7 @@ impl App {
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
                         ui.label(
-                            egui::RichText::new("foobar2000 path")
+                            egui::RichText::new(self.t("foobar2000-path"))
                                 .size(12.0)
                                 .color(MUTED),
                         );
@@ -2939,7 +2955,7 @@ impl App {
                                                 self.persisted.settings.foobar2000_path
                                                     .as_ref()
                                                     .map(|p| p.display().to_string())
-                                                    .unwrap_or_else(|| "Not set".to_string()),
+                                                    .unwrap_or_else(|| self.t("not-set").to_string()),
                                             )
                                             .size(11.5)
                                             .color(TEXT),
@@ -2947,9 +2963,9 @@ impl App {
                                         .truncate(),
                                     );
                                 });
-                            if theme::small_button(ui, "Browse…", TEXT).clicked() {
+                            if theme::small_button(ui, self.t("browse"), TEXT).clicked() {
                                 if let Some(path) = rfd::FileDialog::new()
-                                    .set_title("Select foobar2000.exe")
+                                    .set_title(self.t("select-foobar2000"))
                                     .add_filter("Executable", &["exe"])
                                     .pick_file()
                                 {
@@ -2957,17 +2973,18 @@ impl App {
                                     changed = true;
                                 }
                             }
-                            if theme::small_button(ui, "Clear", TEXT).clicked() {
+                            if theme::small_button(ui, self.t("clear"), TEXT).clicked() {
                                 self.persisted.settings.foobar2000_path = None;
                                 changed = true;
                             }
                         });
                     });
                     ui.add_space(4.0);
+                    let auto_retry_label = self.t("auto-retry");
                     if ui
                         .checkbox(
                             &mut self.persisted.settings.auto_retry,
-                            egui::RichText::new("Auto-retry failed downloads (temporary errors)")
+                            egui::RichText::new(auto_retry_label)
                                 .size(12.5),
                         )
                         .changed()
@@ -2977,24 +2994,26 @@ impl App {
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
                         ui.label(
-                            egui::RichText::new("Max retries")
+                            egui::RichText::new(self.t("max-retries"))
                                 .size(12.0)
                                 .color(MUTED),
                         );
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            let attempts = self.t("attempts");
                             ui.add(
                                 egui::DragValue::new(&mut self.persisted.settings.max_retries)
                                     .range(0..=10)
                                     .speed(0.5)
-                                    .suffix(" attempts"),
+                                    .suffix(attempts),
                             );
                         });
                     });
                     ui.add_space(4.0);
+                    let show_new_badges_label = self.t("show-new-badges");
                     if ui
                         .checkbox(
                             &mut self.persisted.settings.show_new_badges,
-                            egui::RichText::new("Show NEW badges for unseen releases")
+                            egui::RichText::new(show_new_badges_label)
                                 .size(12.5),
                         )
                         .changed()
@@ -3004,23 +3023,23 @@ impl App {
                 });
 
                 ui.add_space(14.0);
-                settings_card(ui, "Auto-save rules", |ui| {
+                settings_card(ui, self.t("auto-save-rules"), |ui| {
                     ui.label(
-                        egui::RichText::new(
-                            "New Discover releases that match an enabled rule are saved to your watchlist automatically.",
-                        )
-                        .size(11.5)
-                        .color(MUTED),
+                        egui::RichText::new(self.t("auto-save-rules-desc"))
+                            .size(11.5)
+                            .color(MUTED),
                     );
                     ui.add_space(10.0);
                     if self.persisted.save_rules.is_empty() && draft.is_none() {
                         ui.label(
-                            egui::RichText::new("No rules yet.")
+                            egui::RichText::new(self.t("no-rules-yet"))
                                 .size(11.5)
                                 .color(DIM),
                         );
                         ui.add_space(8.0);
                     }
+                    let delete_rule_label = self.t("delete-rule");
+                    let enable_rule_label = self.t("enable-rule");
                     for (index, rule) in self.persisted.save_rules.iter_mut().enumerate() {
                         Frame::none()
                             .fill(BG)
@@ -3031,7 +3050,7 @@ impl App {
                                 ui.horizontal(|ui| {
                                     if ui
                                         .checkbox(&mut rule.enabled, "")
-                                        .on_hover_text("Enable or pause this rule")
+                                        .on_hover_text(&enable_rule_label)
                                         .changed()
                                     {
                                         rules_changed = true;
@@ -3057,7 +3076,7 @@ impl App {
                                         Layout::right_to_left(Align::Center),
                                         |ui| {
                                             if theme::icon_button(ui, Icon::Trash, 24.0, DIM)
-                                                .on_hover_text("Delete rule")
+                                                .on_hover_text(&delete_rule_label)
                                                 .clicked()
                                             {
                                                 remove_rule = Some(index);
@@ -3077,7 +3096,7 @@ impl App {
                             .inner_margin(Margin::symmetric(10.0, 9.0))
                             .show(ui, |ui| {
                                 ui.label(
-                                    egui::RichText::new("MATCH TEXT")
+                                    egui::RichText::new(self.t("match-text"))
                                         .size(9.5)
                                         .strong()
                                         .color(DIM),
@@ -3086,13 +3105,13 @@ impl App {
                                 ui.add_sized(
                                     [ui.available_width().min(360.0), 30.0],
                                     TextEdit::singleline(&mut draft.query)
-                                        .hint_text("Artist, title, or tag…")
+                                        .hint_text(self.t("hint-artist-title-tag"))
                                         .margin(Margin::symmetric(9.0, 6.0)),
                                 );
                                 ui.add_space(7.0);
                                 ui.horizontal_wrapped(|ui| {
                                     ui.label(
-                                        egui::RichText::new("IN")
+                                        egui::RichText::new(self.t("in-field"))
                                             .size(9.5)
                                             .strong()
                                             .color(DIM),
@@ -3112,7 +3131,7 @@ impl App {
                                 ui.add_space(7.0);
                                 ui.horizontal_wrapped(|ui| {
                                     ui.label(
-                                        egui::RichText::new("FOLDER")
+                                        egui::RichText::new(self.t("folder-optional"))
                                             .size(9.5)
                                             .strong()
                                             .color(DIM),
@@ -3120,26 +3139,26 @@ impl App {
                                     ui.add_sized(
                                         [180.0, 28.0],
                                         TextEdit::singleline(&mut draft.folder)
-                                            .hint_text("Optional")
+                                            .hint_text(self.t("optional"))
                                             .margin(Margin::symmetric(9.0, 5.0)),
                                     );
-                                    if theme::primary_button_w(ui, "Add rule", 82.0).clicked() {
+                                    if theme::primary_button_w(ui, self.t("add-rule"), 82.0).clicked() {
                                         commit_rule = true;
                                     }
-                                    if theme::small_button(ui, "Cancel", DIM).clicked() {
+                                    if theme::small_button(ui, self.t("cancel"), DIM).clicked() {
                                         cancel_rule = true;
                                     }
                                 });
                             });
-                    } else if theme::small_button(ui, "Add rule", TEXT).clicked() {
+                    } else if theme::small_button(ui, self.t("add-rule"), TEXT).clicked() {
                         add_rule = true;
                     }
                 });
 
                 ui.add_space(14.0);
-                settings_card(ui, "Appearance", |ui| {
+                settings_card(ui, self.t("appearance"), |ui| {
                     ui.label(
-                        egui::RichText::new("Accent color")
+                        egui::RichText::new(self.t("accent-color"))
                             .size(12.0)
                             .color(MUTED),
                     );
@@ -3177,15 +3196,16 @@ impl App {
                     ui.add_space(16.0);
                     ui.horizontal(|ui| {
                         ui.label(
-                            egui::RichText::new("Thumbnail memory budget")
+                            egui::RichText::new(self.t("thumbnail-budget"))
                                 .size(12.0)
                                 .color(MUTED),
                         );
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             ui.label(
                                 egui::RichText::new(format!(
-                                    "{} textures",
-                                    self.persisted.settings.texture_budget
+                                    "{} {}",
+                                    self.persisted.settings.texture_budget,
+                                    self.t("textures")
                                 ))
                                 .size(12.0)
                                 .strong()
@@ -3210,24 +3230,25 @@ impl App {
                 });
 
                 ui.add_space(14.0);
-                settings_card(ui, "Notifications & tray", |ui| {
+                let notifications_tray_title = self.t("notifications-tray");
+                settings_card(ui, notifications_tray_title, |ui| {
+                    let notify_label = self.t("notify-on-complete");
                     if ui
                         .checkbox(
                             &mut self.persisted.settings.notify_on_complete,
-                            egui::RichText::new(
-                                "Show desktop notifications when downloads finish or fail",
-                            )
-                            .size(12.5),
+                            egui::RichText::new(notify_label)
+                                .size(12.5),
                         )
                         .changed()
                     {
                         changed = true;
                     }
                     ui.add_space(6.0);
+                    let tray_label = self.t("show-tray-icon");
                     if ui
                         .checkbox(
                             &mut self.persisted.settings.show_tray_icon,
-                            egui::RichText::new("Show a tray icon").size(12.5),
+                            egui::RichText::new(tray_label).size(12.5),
                         )
                         .changed()
                     {
@@ -3239,15 +3260,13 @@ impl App {
                     }
                     ui.add_space(6.0);
                     let tray_available = self.persisted.settings.show_tray_icon;
+                    let close_to_tray_label = self.t("close-to-tray");
                     if ui
                         .add_enabled(
                             tray_available,
                             egui::Checkbox::new(
                                 &mut self.persisted.settings.close_to_tray,
-                                egui::RichText::new(
-                                    "Closing the window keeps the app running in the tray",
-                                )
-                                .size(12.5),
+                                egui::RichText::new(close_to_tray_label).size(12.5),
                             ),
                         )
                         .changed()
@@ -3257,35 +3276,57 @@ impl App {
                 });
 
                 ui.add_space(14.0);
-                settings_card(ui, "Storage", |ui| {
+                settings_card(ui, self.t("language"), |ui| {
+                    ui.label(
+                        egui::RichText::new(self.t("interface-language"))
+                            .size(12.0)
+                            .color(MUTED),
+                    );
+                    ui.add_space(8.0);
+                    ui.horizontal_wrapped(|ui| {
+                        for lang in Language::all() {
+                            let selected = self.i18n.language() == lang;
+                            let label = format!("{} {}", lang.flag(), lang.display_name());
+                            let resp = ui.selectable_label(selected, label);
+                            if resp.clicked() {
+                                self.set_language(lang);
+                                changed = true;
+                            }
+                        }
+                    });
+                });
+
+                ui.add_space(14.0);
+                settings_card(ui, self.t("storage"), |ui| {
                     self.dl_ui.cache_bytes = store::cache_size();
                     ui.horizontal(|ui| {
                         ui.vertical(|ui| {
                             ui.label(
-                                egui::RichText::new("Image cache")
+                                egui::RichText::new(self.t("image-cache"))
                                     .size(12.5)
                                     .strong()
                                     .color(TEXT),
                             );
                             ui.label(
                                 egui::RichText::new(format!(
-                                    "{} stored on disk",
-                                    store::human_size(self.dl_ui.cache_bytes)
+                                    "{} {}",
+                                    store::human_size(self.dl_ui.cache_bytes),
+                                    self.t("stored-on-disk")
                                 ))
                                 .size(11.5)
                                 .color(MUTED),
                             );
                         });
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if theme::secondary_button(ui, "Clear cache").clicked() {
+                            if theme::secondary_button(ui, self.t("clear-cache")).clicked() {
                                 store::clear_cache();
                                 self.textures = Textures::default();
                                 self.images.clear_failed();
                                 self.images.reset_requests();
                                 self.dl_ui.cache_bytes = store::cache_size();
-                                self.toast("Image cache cleared", ToastTone::Success);
+                                self.toast(self.t("cache-cleared"), ToastTone::Success);
                             }
-                            if theme::secondary_button(ui, "Open data folder").clicked() {
+                            if theme::secondary_button(ui, self.t("open-data-folder")).clicked() {
                                 store::open_path(&store::data_dir());
                             }
                         });
@@ -3293,25 +3334,25 @@ impl App {
                 });
                 
                 ui.add_space(14.0);
-                settings_card(ui, "Import / Export", |ui| {
+                settings_card(ui, self.t("import-export"), |ui| {
                     ui.horizontal(|ui| {
-                        if theme::secondary_button(ui, "Export all").clicked() {
+                        if theme::secondary_button(ui, self.t("export-all")).clicked() {
                             self.export_all();
                         }
-                        if theme::secondary_button(ui, "Import…").clicked() {
+                        if theme::secondary_button(ui, self.t("import")).clicked() {
                             self.import_all();
                         }
                     });
                     ui.add_space(4.0);
                     ui.label(
-                        egui::RichText::new("Exports/imports settings, watchlist, library, and auto-save rules as JSON.")
+                        egui::RichText::new(self.t("import-export-desc"))
                             .size(10.5)
                             .color(DIM),
                     );
                 });
                 
                 ui.add_space(14.0);
-                settings_card(ui, "About", |ui| {
+                settings_card(ui, self.t("about"), |ui| {
                     ui.label(
                         egui::RichText::new("DST-Explorer")
                             .size(15.0)
@@ -3319,24 +3360,22 @@ impl App {
                             .color(TEXT),
                     );
                     ui.label(
-                        egui::RichText::new(format!("Version {} · unofficial desktop client", env!("CARGO_PKG_VERSION")))
+                        egui::RichText::new(format!("Version {} · {}", env!("CARGO_PKG_VERSION"), self.t("desktop-client")))
                             .size(11.5)
                             .color(MUTED),
                     );
                     ui.add_space(8.0);
                     ui.label(
-                        egui::RichText::new(
-                            "Browse and download from DoujinStyle.com with fast previews, a virtualized grid, and a resumable download queue. All music, games, and artwork belong to their respective creators. Please support the original artists.",
-                        )
-                        .size(11.5)
-                        .color(MUTED),
+                        egui::RichText::new(self.t("about-desc"))
+                            .size(11.5)
+                            .color(MUTED),
                     );
                     ui.add_space(10.0);
                     ui.horizontal(|ui| {
-                        if theme::secondary_button(ui, "Open DoujinStyle").clicked() {
+                        if theme::secondary_button(ui, self.t("open-doujinstyle")).clicked() {
                             let _ = webbrowser::open("https://doujinstyle.com");
                         }
-                        if theme::secondary_button(ui, "Show shortcuts").clicked() {
+                        if theme::secondary_button(ui, self.t("show-shortcuts")).clicked() {
                             self.toast(
                                 "Ctrl+F search · Ctrl+R refresh · Ctrl+D download · Esc close",
                                 ToastTone::Info,
@@ -4018,18 +4057,21 @@ fn draw_search_field(ui: &mut Ui, query: &mut String, width: f32) -> Response {
 
 fn view_header(
     ui: &mut Ui,
-    eyebrow: &str,
-    title: &str,
-    subtitle: &str,
+    eyebrow: impl Into<String>,
+    title: impl Into<String>,
+    subtitle: impl Into<String>,
     actions: impl FnOnce(&mut Ui),
 ) {
+    let eyebrow = eyebrow.into();
+    let title = title.into();
+    let subtitle = subtitle.into();
     if ui.available_width() < 560.0 {
-        view_heading(ui, eyebrow, title, subtitle);
+        view_heading(ui, &eyebrow, &title, &subtitle);
         ui.add_space(10.0);
         ui.horizontal_wrapped(actions);
     } else {
         ui.horizontal(|ui| {
-            view_heading(ui, eyebrow, title, subtitle);
+            view_heading(ui, &eyebrow, &title, &subtitle);
             ui.with_layout(Layout::right_to_left(Align::Center), actions);
         });
     }
@@ -4128,10 +4170,11 @@ fn nav_row(
     ui: &mut Ui,
     selected: bool,
     icon: Icon,
-    label: &str,
+    label: impl Into<String>,
     badge: Option<usize>,
     compact: bool,
 ) -> bool {
+    let label = label.into();
     let width = ui.available_width();
     let (rect, mut response) = ui.allocate_exact_size(vec2(width, 40.0), Sense::click());
     let hovered = response.hovered() || ui.rect_contains_pointer(rect);
@@ -4285,25 +4328,25 @@ impl SidePanelLeft {
                 }
                 ui.add_space(if compact { 22.0 } else { 28.0 });
                 if !compact {
-                    ui.label(egui::RichText::new("BROWSE").size(9.5).strong().color(DIM));
+                    ui.label(egui::RichText::new(app.t("browse-section")).size(9.5).strong().color(DIM));
                     ui.add_space(7.0);
                 }
                 let items = [
-                    (View::Discover, Icon::Compass, "Discover", None),
-                    (View::Search, Icon::Search, "Search", None),
+                    (View::Discover, Icon::Compass, app.t("nav-discover"), None),
+                    (View::Search, Icon::Search, app.t("nav-search"), None),
                     (
                         View::Watchlist,
                         Icon::Star,
-                        "Watchlist",
+                        app.t("nav-watchlist"),
                         Some(app.persisted.watchlist.len()),
                     ),
                     (
                         View::Library,
                         Icon::Folder,
-                        "Library",
+                        app.t("nav-library"),
                         Some(app.persisted.library.len()),
                     ),
-                    (View::Downloads, Icon::Download, "Downloads", Some(active)),
+                    (View::Downloads, Icon::Download, app.t("nav-downloads"), Some(active)),
                 ];
                 for (view, icon, label, badge) in items {
                     if nav_row(ui, app.view == view, icon, label, badge, compact) {
@@ -4321,7 +4364,7 @@ impl SidePanelLeft {
                             ui,
                             app.view == View::Settings,
                             Icon::Settings,
-                            "Settings",
+                            app.t("nav-settings"),
                             None,
                             true,
                         ) {
@@ -4331,8 +4374,9 @@ impl SidePanelLeft {
                     }
                     ui.label(
                         egui::RichText::new(format!(
-                            "v{} · unofficial desktop client",
-                            env!("CARGO_PKG_VERSION")
+                            "v{} · {}",
+                            env!("CARGO_PKG_VERSION"),
+                            app.t("desktop-client")
                         ))
                         .size(9.5)
                         .color(DIM),
@@ -4342,7 +4386,7 @@ impl SidePanelLeft {
                         ui,
                         app.view == View::Settings,
                         Icon::Settings,
-                        "Settings",
+                        app.t("nav-settings"),
                         None,
                         false,
                     ) {
@@ -4355,7 +4399,7 @@ impl SidePanelLeft {
                         let (rect, _) = ui.allocate_exact_size(vec2(13.0, 13.0), Sense::hover());
                         theme::paint_icon(ui.painter(), rect, Icon::Grid, DIM, 1.2);
                         ui.label(
-                            egui::RichText::new(format!("{cache_text} image cache"))
+                            egui::RichText::new(format!("{} {}", cache_text, app.t("image-cache")))
                                 .size(10.0)
                                 .color(DIM),
                         );
@@ -4367,7 +4411,7 @@ impl SidePanelLeft {
                                 ui.allocate_exact_size(vec2(13.0, 13.0), Sense::hover());
                             ui.painter().circle_filled(rect.center(), 3.0, accent());
                             ui.label(
-                                egui::RichText::new(format!("{active} downloads active"))
+                                egui::RichText::new(format!("{active} {}", app.t("downloads-active")))
                                     .size(10.0)
                                     .color(MUTED),
                             );
@@ -5157,8 +5201,8 @@ fn format_eta(seconds: f32) -> String {
     }
 }
 
-fn settings_card(ui: &mut Ui, title: &str, contents: impl FnOnce(&mut Ui)) {
-    ui.label(egui::RichText::new(title).size(12.5).strong().color(TEXT));
+fn settings_card(ui: &mut Ui, title: impl Into<String>, contents: impl FnOnce(&mut Ui)) {
+    ui.label(egui::RichText::new(title.into()).size(12.5).strong().color(TEXT));
     ui.add_space(6.0);
     Frame::none()
         .fill(PANEL)
