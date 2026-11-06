@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 pub const SITE: &str = "https://doujinstyle.com";
-pub const STATE_VERSION: u32 = 4;
+pub const STATE_VERSION: u32 = 5;
 pub const SEARCH_HISTORY_LIMIT: usize = 24;
 pub const SAVED_SEARCH_LIMIT: usize = 40;
 
@@ -325,6 +325,32 @@ pub struct Settings {
     pub auto_retry: bool,
     pub max_retries: usize,
     pub language: String,
+    /// Delete the downloaded archive once it has been extracted successfully.
+    pub delete_source_after_extract: bool,
+    /// Global download speed cap in KB/s. 0 means unlimited.
+    pub speed_limit_kbps: u32,
+    /// Resume interrupted downloads automatically on the next launch.
+    pub resume_on_start: bool,
+    /// Show covers only in grids (no title/artist text).
+    pub compact_grid: bool,
+    /// UI scale factor (1.0 = 100%).
+    pub ui_scale: f32,
+    /// Copy state.json into a rolling backup folder when it changes.
+    pub auto_backup: bool,
+    /// Only dispatch downloads inside the configured time window.
+    pub scheduler_enabled: bool,
+    pub schedule_start_hour: u8,
+    pub schedule_end_hour: u8,
+    /// Notify when a saved search matches newly fetched releases.
+    pub notify_saved_searches: bool,
+    /// Library list ordering.
+    pub library_sort: LibrarySort,
+    /// Show release year in library rows.
+    pub library_show_year: bool,
+    /// Show tags in library rows.
+    pub library_show_tags: bool,
+    /// RSS/Atom feeds polled for new releases.
+    pub rss_feeds: Vec<String>,
 }
 
 impl Default for Settings {
@@ -348,8 +374,62 @@ impl Default for Settings {
             auto_retry: true,
             max_retries: 3,
             language: "en-US".to_string(),
+            delete_source_after_extract: false,
+            speed_limit_kbps: 0,
+            resume_on_start: true,
+            compact_grid: false,
+            ui_scale: 1.0,
+            auto_backup: true,
+            scheduler_enabled: false,
+            schedule_start_hour: 2,
+            schedule_end_hour: 6,
+            notify_saved_searches: true,
+            library_sort: LibrarySort::Newest,
+            library_show_year: true,
+            library_show_tags: false,
+            rss_feeds: Vec::new(),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LibrarySort {
+    Title,
+    Artist,
+    Format,
+    #[default]
+    Newest,
+    Size,
+}
+
+impl LibrarySort {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Title => "Title",
+            Self::Artist => "Artist",
+            Self::Format => "Format",
+            Self::Newest => "Newest",
+            Self::Size => "Size",
+        }
+    }
+
+    pub const ALL: [Self; 5] = [
+        Self::Newest,
+        Self::Title,
+        Self::Artist,
+        Self::Format,
+        Self::Size,
+    ];
+}
+
+/// Format-based quality classes. DoujinStyle does not expose a bitrate field,
+/// so "lossless" is derived from the album format tag.
+pub fn is_lossless_format(format: &str) -> bool {
+    let format = format.trim().to_ascii_lowercase();
+    ["flac", "wav", "tta", "ape", "alac", "dsd", "dsf", "aiff"]
+        .iter()
+        .any(|needle| format.contains(needle))
 }
 
 /// A finished download that belongs to the user's local collection.
@@ -414,6 +494,8 @@ pub struct Persisted {
     pub save_rules: Vec<SaveRule>,
     pub last_seen_id: u64,
     pub last_visit: u64,
+    /// Links already announced by the RSS watcher.
+    pub rss_seen: Vec<String>,
 }
 
 impl Default for Persisted {
@@ -430,6 +512,7 @@ impl Default for Persisted {
             save_rules: Vec::new(),
             last_seen_id: 0,
             last_visit: 0,
+            rss_seen: Vec::new(),
         }
     }
 }

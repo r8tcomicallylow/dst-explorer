@@ -66,6 +66,62 @@ pub fn save_state(state: &Persisted) {
     if let Err(err) = persist::write_json(&config_path(), state) {
         eprintln!("Could not save state: {err}");
     }
+    if state.settings.auto_backup {
+        backup_state();
+    }
+}
+
+/// Copy state.json into `data/backups` once per day and keep the last 10 copies.
+pub fn backup_state() {
+    let state_path = config_path();
+    if !state_path.exists() {
+        return;
+    }
+    let dir = data_dir().join("backups");
+    if fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let stamp = chrono::Local::now().format("%Y%m%d").to_string();
+    let target = dir.join(format!("state-{stamp}.json"));
+    if target.exists() {
+        return;
+    }
+    let _ = fs::copy(&state_path, &target);
+    prune_backups(&dir, 10);
+}
+
+fn prune_backups(dir: &Path, keep: usize) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut files: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| ext.eq_ignore_ascii_case("json"))
+                .unwrap_or(false)
+        })
+        .collect();
+    if files.len() <= keep {
+        return;
+    }
+    files.sort();
+    for path in files.iter().take(files.len() - keep) {
+        let _ = fs::remove_file(path);
+    }
+}
+
+pub fn last_backup() -> Option<PathBuf> {
+    let dir = data_dir().join("backups");
+    let mut files: Vec<PathBuf> = fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .collect();
+    files.sort();
+    files.pop()
 }
 
 pub fn now_unix() -> u64 {

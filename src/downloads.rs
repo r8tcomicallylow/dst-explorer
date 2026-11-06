@@ -14,6 +14,9 @@ use reqwest::header::{CONTENT_DISPOSITION, CONTENT_TYPE, RANGE};
 use reqwest::redirect::Policy;
 use serde::{Deserialize, Serialize};
 
+use base64::Engine as _;
+use md5::{Digest, Md5};
+
 use crate::api::{self, Resolution, USER_AGENT as UA};
 use crate::models::Album;
 use crate::{persist, store};
@@ -120,6 +123,8 @@ pub struct DownloadTask {
     pub output: Option<PathBuf>,
     pub extracted: Option<PathBuf>,
     pub warning: Option<String>,
+    /// Host the direct file was resolved to (e.g. mediafire.com).
+    pub host: Option<String>,
     pub created: Instant,
 }
 
@@ -147,6 +152,7 @@ struct PersistedTask {
     output: Option<PathBuf>,
     extracted: Option<PathBuf>,
     warning: Option<String>,
+    host: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -190,6 +196,10 @@ enum DlEvent {
     Cancelled {
         id: u64,
     },
+    Host {
+        id: u64,
+        host: String,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -210,6 +220,11 @@ pub struct DownloadManager {
     auto_extract: bool,
     auto_retry: bool,
     max_retries: usize,
+    delete_source_after_extract: bool,
+    speed_limit: Arc<AtomicU64>,
+    scheduler_enabled: bool,
+    schedule_start_hour: u8,
+    schedule_end_hour: u8,
     /// Tasks whose worker is being stopped so they can be resumed later. The
     /// worker sends `Cancelled`; until then we must not let its state updates
     /// overwrite the paused state.
@@ -239,6 +254,11 @@ impl DownloadManager {
             auto_extract,
             auto_retry,
             max_retries,
+            delete_source_after_extract: false,
+            speed_limit: Arc::new(AtomicU64::new(0)),
+            scheduler_enabled: false,
+            schedule_start_hour: 2,
+            schedule_end_hour: 6,
             pause_requested: HashSet::new(),
             restored_paused: 0,
         };
@@ -277,6 +297,7 @@ impl DownloadManager {
                 output: saved.output,
                 extracted: saved.extracted,
                 warning: saved.warning,
+                host: saved.host,
                 created: Instant::now(),
             });
         }
@@ -301,6 +322,7 @@ impl DownloadManager {
                     output: task.output.clone(),
                     extracted: task.extracted.clone(),
                     warning: task.warning.clone(),
+                    host: task.host.clone(),
                 })
                 .collect(),
         }
@@ -314,6 +336,7 @@ impl DownloadManager {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn configure(
         &mut self,
         max_concurrent: usize,
@@ -321,13 +344,144 @@ impl DownloadManager {
         auto_extract: bool,
         auto_retry: bool,
         max_retries: usize,
+        delete_source_after_extract: bool,
+        speed_limit_kbps: u32,
+        scheduler_enabled: bool,
+        schedule_start_hour: u8,
+        schedule_end_hour: u8,
     ) {
         self.max_concurrent = max_concurrent.max(1);
         self.download_dir = download_dir;
         self.auto_extract = auto_extract;
         self.auto_retry = auto_retry;
         self.max_retries = max_retries;
+        self.delete_source_after_extract = delete_source_after_extract;
+        self.speed_limit
+            .store(u64::from(speed_limit_kbps) * 1024, Ordering::Relaxed);
+        self.scheduler_enabled = scheduler_enabled;
+        self.schedule_start_hour = schedule_start_hour;
+        self.schedule_end_hour = schedule_end_hour;
         self.dispatch();
+    }
+
+    /// Whether new downloads are currently allowed by the scheduler.
+    pub fn within_schedule(&self) -> bool {
+        if !self.scheduler_enabled {
+            return true;
+        }
+        use chrono::Timelike;
+        let hour = chrono::Local::now().hour() as u8;
+        let start = self.schedule_start_hour.min(23);
+        let end = self.schedule_end_hour.min(23);
+        if start == end {
+            return true;
+        }
+        if start < end {
+            hour >= start && hour < end
+        } else {
+            hour >= start || hour < end
+        }
+    }
+
+    /// Unique hosts seen in the current queue, used by the per-host pause UI.
+    pub fn hosts(&self) -> Vec<String> {
+        let mut hosts: Vec<String> = self
+            .tasks
+            .iter()
+            .filter_map(|task| task.host.clone())
+            .collect();
+        hosts.sort();
+        hosts.dedup();
+        hosts
+    }
+
+    pub fn pause_host(&mut self, host: &str) {
+        let ids: Vec<u64> = self
+            .tasks
+            .iter()
+            .filter(|task| task.host.as_deref() == Some(host))
+            .filter(|task| task.state.is_active())
+            .map(|task| task.id)
+            .collect();
+        for id in ids {
+            self.pause(id);
+        }
+    }
+
+    pub fn resume_host(&mut self, host: &str) {
+        let ids: Vec<u64> = self
+            .tasks
+            .iter()
+            .filter(|task| task.host.as_deref() == Some(host))
+            .filter(|task| task.state == DownloadState::Paused)
+            .map(|task| task.id)
+            .collect();
+        for id in ids {
+            self.resume(id);
+        }
+    }
+
+    /// Move a queued task to the front of the queue.
+    pub fn prioritize(&mut self, id: u64) {
+        if let Some(pos) = self.queue.iter().position(|queued| *queued == id) {
+            self.queue.remove(pos);
+            self.queue.push_front(id);
+            self.move_task_before_first_queued(id);
+            self.persist();
+            self.dispatch();
+        }
+    }
+
+    pub fn move_up(&mut self, id: u64) {
+        if let Some(pos) = self.queue.iter().position(|queued| *queued == id) {
+            if pos > 0 {
+                self.queue.swap(pos, pos - 1);
+                if let Some(other) = self.queue.get(pos).copied() {
+                    self.swap_task_positions(id, other);
+                }
+                self.persist();
+            }
+        }
+    }
+
+    pub fn move_down(&mut self, id: u64) {
+        if let Some(pos) = self.queue.iter().position(|queued| *queued == id) {
+            if pos + 1 < self.queue.len() {
+                self.queue.swap(pos, pos + 1);
+                if let Some(other) = self.queue.get(pos).copied() {
+                    self.swap_task_positions(id, other);
+                }
+                self.persist();
+            }
+        }
+    }
+
+    fn swap_task_positions(&mut self, a: u64, b: u64) {
+        if let (Some(i), Some(j)) = (
+            self.tasks.iter().position(|task| task.id == a),
+            self.tasks.iter().position(|task| task.id == b),
+        ) {
+            self.tasks.swap(i, j);
+        }
+    }
+
+    fn move_task_before_first_queued(&mut self, id: u64) {
+        let Some(from) = self.tasks.iter().position(|task| task.id == id) else {
+            return;
+        };
+        let Some(mut target) = self
+            .tasks
+            .iter()
+            .position(|task| task.state == DownloadState::Queued && task.id != id)
+        else {
+            return;
+        };
+        if from < target {
+            target -= 1;
+        }
+        let task = self.tasks.remove(from);
+        let target = target.min(self.tasks.len());
+        self.tasks.insert(target, task);
     }
 
     pub fn enqueue(&mut self, album: Album) -> Option<u64> {
@@ -350,6 +504,7 @@ impl DownloadManager {
             output: None,
             extracted: None,
             warning: None,
+            host: None,
             created: Instant::now(),
         });
         self.tasks.sort_by(|a, b| b.created.cmp(&a.created));
@@ -635,6 +790,14 @@ impl DownloadManager {
                     self.finish_one();
                     changed = true;
                 }
+                DlEvent::Host { id, host } => {
+                    if let Some(task) = self.tasks.iter_mut().find(|t| t.id == id) {
+                        if task.host.as_deref() != Some(host.as_str()) {
+                            task.host = Some(host);
+                            changed = true;
+                        }
+                    }
+                }
                 DlEvent::Cancelled { id } => {
                     let paused = self.pause_requested.remove(&id);
                     if let Some(task) = self.tasks.iter_mut().find(|t| t.id == id) {
@@ -666,6 +829,9 @@ impl DownloadManager {
     }
 
     fn dispatch(&mut self) {
+        if !self.within_schedule() {
+            return;
+        }
         let mut started = false;
         while self.active < self.max_concurrent {
             let id = match self.queue.pop_front() {
@@ -690,9 +856,24 @@ impl DownloadManager {
             let auto_extract = self.auto_extract;
             let auto_retry = self.auto_retry;
             let max_retries = self.max_retries;
+            let delete_source = self.delete_source_after_extract;
+            let speed_limit = self.speed_limit.clone();
             let _ = thread::Builder::new()
                 .name(format!("download-{id}"))
-                .spawn(move || run_download(id, album, progress, dir, auto_extract, auto_retry, max_retries, tx));
+                .spawn(move || {
+                    run_download(
+                        id,
+                        album,
+                        progress,
+                        dir,
+                        auto_extract,
+                        auto_retry,
+                        max_retries,
+                        delete_source,
+                        speed_limit,
+                        tx,
+                    )
+                });
         }
         if started {
             self.persist();
@@ -700,6 +881,7 @@ impl DownloadManager {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_download(
     id: u64,
     album: Album,
@@ -708,6 +890,8 @@ fn run_download(
     auto_extract: bool,
     auto_retry: bool,
     max_retries: usize,
+    delete_source: bool,
+    speed_limit: Arc<AtomicU64>,
     tx: Sender<DlEvent>,
 ) {
     let mut attempt = 0;
@@ -767,6 +951,13 @@ fn run_download(
             state: DownloadState::Downloading,
         });
 
+        if let Some(host) = reqwest::Url::parse(&direct.url)
+            .ok()
+            .and_then(|url| url.host_str().map(|host| host.to_string()))
+        {
+            let _ = tx.send(DlEvent::Host { id, host });
+        }
+
         let client = match Client::builder()
             .user_agent(UA)
             .connect_timeout(Duration::from_secs(20))
@@ -792,6 +983,7 @@ fn run_download(
             &album,
             &download_dir,
             &progress,
+            &speed_limit,
         ) {
             Ok(path) => path,
             Err(DownloadError::Cancelled) => {
@@ -816,7 +1008,21 @@ fn run_download(
                 state: DownloadState::Extracting,
             });
             match extract_zip(&downloaded) {
-                Ok(folder) => extracted = Some(folder),
+                Ok(folder) => {
+                    extracted = Some(folder);
+                    if delete_source {
+                        match fs::remove_file(&downloaded) {
+                            Ok(()) => {
+                                warning = Some("Source archive deleted after extraction.".into())
+                            }
+                            Err(error) => {
+                                warning = Some(format!(
+                                    "Extracted, but could not delete the source archive: {error}"
+                                ))
+                            }
+                        }
+                    }
+                }
                 Err(error) => warning = Some(format!("Downloaded, but could not extract: {error}")),
             }
         }
@@ -863,6 +1069,48 @@ enum DownloadError {
     Failed(String),
 }
 
+/// Minimal blocking downloader used by the command-line interface.
+///
+/// Resolves the external host link for `album_id`, downloads the file into
+/// `dir`, and returns the final path. Extraction is left to the GUI/queue.
+pub fn cli_download(album_id: u64, dir: &Path) -> Result<PathBuf, String> {
+    fs::create_dir_all(dir).map_err(|error| format!("Could not create {}: {error}", dir.display()))?;
+    let resolution = api::resolve_download(album_id)?;
+    let direct = match resolution {
+        Resolution::Direct(direct) => direct,
+        Resolution::Manual { url, reason } => {
+            return Err(format!("Manual download required: {url} ({reason})"))
+        }
+    };
+    let client = Client::builder()
+        .user_agent(UA)
+        .connect_timeout(Duration::from_secs(20))
+        .redirect(Policy::limited(10))
+        .build()
+        .map_err(|error| format!("Could not start HTTP client: {error}"))?;
+    let album = Album {
+        id: album_id,
+        title: format!("album-{album_id}"),
+        ..Album::default()
+    };
+    let progress = Progress::default();
+    let speed_limit = AtomicU64::new(0);
+    download_file(
+        &client,
+        &direct.url,
+        &direct.headers,
+        &album,
+        dir,
+        &progress,
+        &speed_limit,
+    )
+    .map_err(|error| match error {
+        DownloadError::Cancelled => "Download cancelled.".to_string(),
+        DownloadError::Failed(message) => message,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 fn download_file(
     client: &Client,
     url: &str,
@@ -870,6 +1118,7 @@ fn download_file(
     album: &Album,
     download_dir: &Path,
     progress: &Progress,
+    speed_limit: &AtomicU64,
 ) -> Result<PathBuf, DownloadError> {
     if let Err(err) = fs::create_dir_all(download_dir) {
         return Err(DownloadError::Failed(format!(
@@ -957,6 +1206,13 @@ fn download_file(
     }
 
     let start_bytes = if append { existing } else { 0 };
+    let expected_md5 = response
+        .headers()
+        .get("content-md5")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let mut hasher = if start_bytes == 0 { Some(Md5::new()) } else { None };
 
     let file = OpenOptions::new()
         .create(true)
@@ -978,6 +1234,8 @@ fn download_file(
 
     let mut buffer = vec![0u8; 256 * 1024];
     let mut downloaded = start_bytes;
+    let mut window_start = Instant::now();
+    let mut window_bytes = 0u64;
     loop {
         if progress.is_cancelled() {
             let _ = writer.flush();
@@ -996,8 +1254,31 @@ fn download_file(
         writer
             .write_all(&buffer[..read])
             .map_err(|e| DownloadError::Failed(format!("Could not write file: {e}")))?;
+        if let Some(hasher) = hasher.as_mut() {
+            hasher.update(&buffer[..read]);
+        }
         downloaded += read as u64;
+        window_bytes += read as u64;
         progress.downloaded.store(downloaded, Ordering::Relaxed);
+
+        // Smooth global rate limit: sleep when we are ahead of the budget.
+        let limit = speed_limit.load(Ordering::Relaxed);
+        if limit > 0 {
+            let elapsed = window_start.elapsed().as_secs_f64();
+            if elapsed > 0.0 {
+                let allowed = limit as f64 * elapsed;
+                if window_bytes as f64 > allowed {
+                    let sleep = (window_bytes as f64 - allowed) / limit as f64;
+                    if sleep > 0.0 {
+                        std::thread::sleep(Duration::from_secs_f64(sleep.min(0.25)));
+                    }
+                }
+            }
+            if elapsed >= 1.0 {
+                window_start = Instant::now();
+                window_bytes = 0;
+            }
+        }
     }
 
     writer
@@ -1016,6 +1297,17 @@ fn download_file(
             crate::store::human_size(downloaded),
             crate::store::human_size(total)
         )));
+    }
+
+    if let (Some(hasher), Some(expected)) = (hasher, expected_md5.as_deref()) {
+        let digest = hasher.finalize();
+        let actual = base64::engine::general_purpose::STANDARD.encode(digest);
+        if !actual.eq_ignore_ascii_case(expected) {
+            let _ = fs::remove_file(&part_path);
+            return Err(DownloadError::Failed(format!(
+                "Checksum mismatch (expected {expected}, got {actual}). The file was discarded."
+            )));
+        }
     }
 
     fs::rename(&part_path, &final_path)
@@ -1218,14 +1510,14 @@ mod tests {
             ..Album::default()
         };
         let progress = Progress::default();
+        let speed_limit = AtomicU64::new(0);
 
         let do_download = || {
-            download_file(&client, url, &[], &album, &dir, &progress).unwrap_or_else(|error| {
-                match error {
+            download_file(&client, url, &[], &album, &dir, &progress, &speed_limit)
+                .unwrap_or_else(|error| match error {
                     DownloadError::Cancelled => panic!("download cancelled"),
                     DownloadError::Failed(message) => panic!("download failed: {message}"),
-                }
-            })
+                })
         };
 
         let path = do_download();
