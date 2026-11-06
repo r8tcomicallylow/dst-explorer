@@ -25,6 +25,19 @@ All notable changes to this project will be documented in this format.
 - Built-in audio preview player (rodio + Symphonia): album/folder queue, gapless pre-roll, seek, pause/stop,
   volume and background waveform extraction, with library/detail play buttons and player hotkeys
 - True light/dark theme with a persisted toggle (`Ctrl+Alt+L`) and a light-aware palette across all widgets
+- Player shuffle and repeat modes (off / all / one), persisted between launches
+- Resume playback from the last track and position on the next launch (toggle in Settings)
+- Album cover in the player bar, clickable to open the matching album card
+- Animated now-playing equaliser and a hover Play button on downloaded cards
+- Undo toasts for watchlist/library removals and for clearing search history
+- Copy album links from the context menu, the selection bar and `Ctrl+Shift+C`
+- Collapsible sidebar, "Surprise me" random-album picker and a Konami-code accent easter egg
+- Tray tooltip with the current track and the number of active downloads
+- Animated view transitions, detail-panel slide, player-bar reveal, sidebar collapse,
+  card hover states, cover fade-in, shimmer placeholders and toast fade-out
+
+### Changed
+- Player queue handling now resets prefetch state correctly when shuffle, repeat or resume changes
 
 ## [1.2.0] - 2026-11-06
 

@@ -360,6 +360,17 @@ pub struct Settings {
     pub audio_volume: f32,
     /// Use the light colour palette.
     pub light_theme: bool,
+    /// Shuffle the player queue instead of playing in order.
+    pub shuffle: bool,
+    /// Repeat mode for the built-in player.
+    pub repeat_mode: RepeatMode,
+    /// Collapse the sidebar to icons only.
+    pub sidebar_collapsed: bool,
+    /// Remember the last played track and resume from its position.
+    pub remember_position: bool,
+    pub last_track_folder: Option<PathBuf>,
+    pub last_track_path: Option<PathBuf>,
+    pub last_track_position: f32,
 }
 
 impl Default for Settings {
@@ -402,6 +413,41 @@ impl Default for Settings {
             audio_enabled: true,
             audio_volume: 0.8,
             light_theme: false,
+            shuffle: false,
+            repeat_mode: RepeatMode::Off,
+            sidebar_collapsed: false,
+            remember_position: true,
+            last_track_folder: None,
+            last_track_path: None,
+            last_track_position: 0.0,
+        }
+    }
+}
+
+/// Playback repeat behaviour for the built-in player.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepeatMode {
+    #[default]
+    Off,
+    All,
+    One,
+}
+
+impl RepeatMode {
+    pub fn cycle(self) -> Self {
+        match self {
+            Self::Off => Self::All,
+            Self::All => Self::One,
+            Self::One => Self::Off,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Repeat off",
+            Self::All => "Repeat all",
+            Self::One => "Repeat one",
         }
     }
 }

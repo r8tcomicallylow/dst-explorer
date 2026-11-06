@@ -15,7 +15,7 @@ pub enum TrayAction {
 /// Native tray icon with a small menu. Events are forwarded through a channel
 /// and wake the egui event loop, so actions also work while the window is hidden.
 pub struct Tray {
-    _icon: TrayIcon,
+    icon: TrayIcon,
     rx: Receiver<TrayAction>,
 }
 
@@ -85,7 +85,11 @@ impl Tray {
             }
         }));
 
-        Some(Self { _icon: tray, rx })
+        Some(Self { icon: tray, rx })
+    }
+
+    pub fn set_tooltip(&self, text: &str) {
+        let _ = self.icon.set_tooltip(Some(text));
     }
 
     pub fn poll(&self) -> Vec<TrayAction> {
