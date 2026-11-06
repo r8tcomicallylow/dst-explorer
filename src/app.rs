@@ -12,22 +12,79 @@ use eframe::egui::{
 use crate::api::{self, FeedPage, SearchParams};
 use crate::audio::{self, AudioPlayer, PlaybackState};
 use crate::downloads::{DownloadManager, DownloadNotice, DownloadState};
-use crate::images::{ImageLoader, ImageSpec, Textures};
 use crate::i18n::{negotiate_best_language, I18n, Language};
+use crate::images::{ImageLoader, ImageSpec, Textures};
 use crate::models::{
     is_lossless_format, sort_albums, Album, AlbumDetail, FormatFilter, LibraryEntry, LibrarySort,
-    Persisted, RuleField, SaveRule, SearchKind, SearchSort, WatchMeta,
+    Persisted, RepeatMode, RuleField, SaveRule, SearchHistoryEntry, SearchKind, SearchSort,
+    WatchMeta,
 };
 use crate::store;
 use crate::theme::{
-    self, accent, accent_dim, Icon, ACCENTS, BG, BORDER_SOFT, BORDER, CARD, CARD_HOVER, DANGER, DIM,
-    MUTED, PANEL, SIDEBAR, SUCCESS, TEXT, WARNING,
+    self, accent, accent_dim, Icon, ACCENTS, BG, BORDER, BORDER_SOFT, CARD, CARD_HOVER, DANGER,
+    DIM, MUTED, PANEL, SIDEBAR, SUCCESS, TEXT, WARNING,
 };
 use crate::tray::{Tray, TrayAction};
 
 const CARD_GAP: f32 = 16.0;
 const MIN_CARD_WIDTH: f32 = 172.0;
 const DETAIL_WIDTH: f32 = 414.0;
+
+/// Smoothly approach `target` using frame-rate independent easing.
+fn approach(value: &mut f32, target: f32, dt: f32, speed: f32) -> f32 {
+    let t = 1.0 - (-dt * speed).exp();
+    *value += (target - *value) * t;
+    if (*value - target).abs() < 0.001 {
+        *value = target;
+    }
+    *value
+}
+
+fn ease_out(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    1.0 - (1.0 - t).powi(3)
+}
+
+fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let mix = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t) as u8;
+    Color32::from_rgba_unmultiplied(
+        mix(a.r(), b.r()),
+        mix(a.g(), b.g()),
+        mix(a.b(), b.b()),
+        mix(a.a(), b.a()),
+    )
+}
+
+fn hash_time(seed: u64) -> u64 {
+    let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^ (x >> 31)
+}
+
+fn random_pick(len: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(1);
+    (hash_time(now ^ std::process::id() as u64) as usize) % len
+}
+
+struct Confetti {
+    x: f32,
+    y: f32,
+    vx: f32,
+    vy: f32,
+    size: f32,
+    spin: f32,
+    color: Color32,
+}
 
 fn search_field_id() -> Id {
     Id::new("search-field")
@@ -132,6 +189,7 @@ enum CardAction {
         shift: bool,
     },
     Download(Album),
+    Play(Album),
     Watch(Album),
     SetFolder {
         album: Album,
@@ -281,6 +339,24 @@ struct Toast {
 enum ToastAction {
     OpenFolder(PathBuf),
     OpenUrl(String),
+    RestoreWatch(Album, Option<WatchMeta>),
+    RestoreLibrary(LibraryEntry),
+    RestoreSearchHistory(Vec<SearchHistoryEntry>),
+}
+
+impl ToastAction {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::OpenFolder(_) | Self::OpenUrl(_) => "Open",
+            Self::RestoreWatch(..) | Self::RestoreLibrary(_) | Self::RestoreSearchHistory(_) => {
+                "Undo"
+            }
+        }
+    }
+
+    fn is_undo(&self) -> bool {
+        !matches!(self, Self::OpenFolder(_) | Self::OpenUrl(_))
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -378,6 +454,21 @@ pub struct App {
 
     // Keyboard shortcuts overlay
     show_shortcuts: bool,
+
+    // Animation clock and transition state (0..=1)
+    last_frame: Instant,
+    anim_dt: f32,
+    view_anim: f32,
+    sidebar_anim: f32,
+    player_anim: f32,
+    detail_anim: f32,
+
+    // Deferred clipboard write + easter egg state
+    pending_clipboard: Option<String>,
+    konami_progress: usize,
+    confetti: Option<(Instant, Vec<Confetti>)>,
+    resume_saved: Instant,
+    tray_tooltip_at: Instant,
 }
 
 impl App {
@@ -468,6 +559,18 @@ impl App {
 
             // Keyboard shortcuts overlay
             show_shortcuts: false,
+
+            last_frame: Instant::now(),
+            anim_dt: 0.016,
+            view_anim: 1.0,
+            sidebar_anim: if settings.sidebar_collapsed { 1.0 } else { 0.0 },
+            player_anim: 0.0,
+            detail_anim: 0.0,
+            pending_clipboard: None,
+            konami_progress: 0,
+            confetti: None,
+            resume_saved: Instant::now(),
+            tray_tooltip_at: Instant::now(),
         };
         app.refresh_latest();
         app.sync_library_from_downloads();
@@ -477,6 +580,24 @@ impl App {
             _ => Language::from_locale(&app.persisted.settings.language),
         };
         app.i18n.set_language(lang);
+        app.player.set_shuffle(app.persisted.settings.shuffle);
+        app.player.set_repeat(app.persisted.settings.repeat_mode);
+        if app.persisted.settings.remember_position {
+            let folder = app.persisted.settings.last_track_folder.clone();
+            let file = app.persisted.settings.last_track_path.clone();
+            let position = app.persisted.settings.last_track_position;
+            if let (Some(folder), Some(file)) = (folder, file) {
+                if file.is_file() && folder.is_dir() {
+                    let title = file
+                        .file_stem()
+                        .map(|name| name.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "last track".to_string());
+                    if app.player.prepare_folder(&folder, &file, position).is_ok() {
+                        app.toast(format!("Press Play to resume “{title}”."), ToastTone::Info);
+                    }
+                }
+            }
+        }
         if app.downloads.restored_paused > 0 {
             let count = app.downloads.restored_paused;
             if app.persisted.settings.resume_on_start {
@@ -755,6 +876,7 @@ impl App {
             }
         }
         let id = album.id;
+        self.detail_anim = 0.0;
         let fallback = album.clone();
         self.detail = Some(DetailState {
             album,
@@ -892,10 +1014,7 @@ impl App {
                                                 .any(|tag| tag.to_lowercase().contains(&needle)),
                                             _ => {
                                                 album.title.to_lowercase().contains(&needle)
-                                                    || album
-                                                        .artist
-                                                        .to_lowercase()
-                                                        .contains(&needle)
+                                                    || album.artist.to_lowercase().contains(&needle)
                                             }
                                         };
                                         if matched
@@ -1005,7 +1124,8 @@ impl App {
                         self.dirty = true;
                     }
                 }
-                NetEvent::Detail { id, result } => {                    if let Some(detail) = self.detail.as_mut() {
+                NetEvent::Detail { id, result } => {
+                    if let Some(detail) = self.detail.as_mut() {
                         if detail.album.id != id {
                             continue;
                         }
@@ -1031,7 +1151,27 @@ impl App {
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
         let typing = ctx.wants_keyboard_input();
-        let (search_shortcut, refresh, escape, download, palette, shortcuts_help, nav_keys, fullscreen, pause_all, resume_all, cycle_theme, play_pause, next_track, prev_track, seek_forward, seek_back, volume_up, volume_down, toggle_light) = ctx.input(|input| {
+        let (
+            search_shortcut,
+            refresh,
+            escape,
+            download,
+            palette,
+            shortcuts_help,
+            nav_keys,
+            fullscreen,
+            pause_all,
+            resume_all,
+            cycle_theme,
+            play_pause,
+            next_track,
+            prev_track,
+            seek_forward,
+            seek_back,
+            volume_up,
+            volume_down,
+            toggle_light,
+        ) = ctx.input(|input| {
             (
                 (input.modifiers.command && input.key_pressed(egui::Key::F))
                     || (!typing && input.key_pressed(egui::Key::Slash)),
@@ -1075,6 +1215,20 @@ impl App {
         if search_shortcut {
             self.view = View::Search;
             self.focus_search = true;
+        }
+        let copy_links = ctx.input(|input| {
+            input.modifiers.command && input.modifiers.shift && input.key_pressed(egui::Key::C)
+        });
+        if copy_links && !self.selection.is_empty() {
+            let links: Vec<String> = self
+                .visible_albums()
+                .iter()
+                .filter(|album| self.selection.contains(&album.id))
+                .map(|album| album.page_url())
+                .collect();
+            if !links.is_empty() {
+                self.pending_clipboard = Some(links.join("\n"));
+            }
         }
         if refresh {
             match self.view {
@@ -1200,6 +1354,134 @@ impl App {
             ctx.memory_mut(|memory| memory.request_focus(search_field_id()));
             self.focus_search = false;
         }
+        self.check_konami(ctx);
+    }
+
+    /// Detect the classic ↑↑↓↓←→←→BA sequence.
+    fn check_konami(&mut self, ctx: &egui::Context) {
+        use egui::Key;
+        const SEQUENCE: [Key; 10] = [
+            Key::ArrowUp,
+            Key::ArrowUp,
+            Key::ArrowDown,
+            Key::ArrowDown,
+            Key::ArrowLeft,
+            Key::ArrowRight,
+            Key::ArrowLeft,
+            Key::ArrowRight,
+            Key::B,
+            Key::A,
+        ];
+        let pressed: Vec<Key> = ctx.input(|input| {
+            SEQUENCE
+                .iter()
+                .copied()
+                .filter(|key| input.key_pressed(*key))
+                .collect()
+        });
+        for key in pressed {
+            if key == SEQUENCE[self.konami_progress] {
+                self.konami_progress += 1;
+            } else if key == SEQUENCE[0] {
+                self.konami_progress = 1;
+            } else {
+                self.konami_progress = 0;
+            }
+            if self.konami_progress >= SEQUENCE.len() {
+                self.konami_progress = 0;
+                self.trigger_konami();
+            }
+        }
+    }
+
+    fn trigger_konami(&mut self) {
+        let next =
+            (self.persisted.settings.accent + 1 + random_pick(ACCENTS.len())) % ACCENTS.len();
+        self.persisted.settings.accent = next;
+        theme::set_accent(next);
+        self.dirty = true;
+        self.toast(
+            format!("Konami code! Accent changed to {}.", ACCENTS[next].0),
+            ToastTone::Success,
+        );
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(1);
+        let palette = [
+            accent(),
+            SUCCESS(),
+            WARNING(),
+            Color32::from_rgb(140, 170, 255),
+            Color32::from_rgb(255, 120, 170),
+        ];
+        let mut particles = Vec::with_capacity(110);
+        for index in 0..110u64 {
+            let seed = hash_time(now ^ (index.wrapping_mul(0x9E37_79B9)));
+            let unit = |shift: u64| ((seed >> shift) & 0xFFFF) as f32 / 65535.0;
+            particles.push(Confetti {
+                x: unit(0),
+                y: unit(16) * 0.35,
+                vx: (unit(32) - 0.5) * 320.0,
+                vy: 40.0 + unit(48) * 220.0,
+                size: 4.0 + unit(5) * 5.0,
+                spin: unit(8) * std::f32::consts::TAU,
+                color: palette[(seed as usize) % palette.len()],
+            });
+        }
+        self.confetti = Some((Instant::now(), particles));
+    }
+
+    fn draw_confetti(&mut self, ctx: &egui::Context) {
+        let Some((start, particles)) = self.confetti.take() else {
+            return;
+        };
+        let elapsed = start.elapsed().as_secs_f32();
+        if elapsed > 2.6 {
+            self.confetti = None;
+            return;
+        }
+        let screen = ctx.screen_rect();
+        let painter = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            Id::new("konami-confetti"),
+        ));
+        let alpha = ((1.0 - elapsed / 2.6) * 255.0).clamp(0.0, 255.0) as u8;
+        for particle in &particles {
+            let x = particle.x * screen.width() + particle.vx * elapsed;
+            let y =
+                particle.y * screen.height() + particle.vy * elapsed + 420.0 * elapsed * elapsed;
+            if y > screen.height() + 24.0 {
+                continue;
+            }
+            let spin = particle.spin + elapsed * 9.0;
+            let color = Color32::from_rgba_unmultiplied(
+                particle.color.r(),
+                particle.color.g(),
+                particle.color.b(),
+                alpha,
+            );
+            let half = particle.size * 0.5;
+            let (sin, cos) = (spin.sin(), spin.cos());
+            let corners = [
+                vec2(-half, -half * 0.55),
+                vec2(half, -half * 0.55),
+                vec2(half, half * 0.55),
+                vec2(-half, half * 0.55),
+            ];
+            let points: Vec<egui::Pos2> = corners
+                .iter()
+                .map(|corner| {
+                    pos2(
+                        x + corner.x * cos - corner.y * sin,
+                        y + corner.x * sin + corner.y * cos,
+                    )
+                })
+                .collect();
+            painter.add(egui::Shape::convex_polygon(points, color, Stroke::NONE));
+        }
+        self.confetti = Some((start, particles));
+        ctx.request_repaint();
     }
 
     /// Open the command palette and build the action list.
@@ -1208,15 +1490,51 @@ impl App {
         self.palette_query.clear();
         self.palette_selected = 0;
         self.palette_actions = vec![
-            ("Search".to_string(), "Search the archive (Ctrl+F)".to_string(), PaletteAction::Search),
-            ("Library".to_string(), "Browse downloaded albums".to_string(), PaletteAction::Library),
-            ("Watchlist".to_string(), "Saved albums with folders and notes".to_string(), PaletteAction::Watchlist),
-            ("Downloads".to_string(), "Active, paused, and finished downloads".to_string(), PaletteAction::Downloads),
-            ("Settings".to_string(), "Configure the app".to_string(), PaletteAction::Settings),
-            ("Refresh".to_string(), "Reload current view (Ctrl+R)".to_string(), PaletteAction::Refresh),
-            ("Pause all downloads".to_string(), "Pause all active downloads".to_string(), PaletteAction::PauseAll),
-            ("Resume all downloads".to_string(), "Resume all paused downloads".to_string(), PaletteAction::ResumeAll),
-            ("Quit".to_string(), "Exit the application".to_string(), PaletteAction::Quit),
+            (
+                "Search".to_string(),
+                "Search the archive (Ctrl+F)".to_string(),
+                PaletteAction::Search,
+            ),
+            (
+                "Library".to_string(),
+                "Browse downloaded albums".to_string(),
+                PaletteAction::Library,
+            ),
+            (
+                "Watchlist".to_string(),
+                "Saved albums with folders and notes".to_string(),
+                PaletteAction::Watchlist,
+            ),
+            (
+                "Downloads".to_string(),
+                "Active, paused, and finished downloads".to_string(),
+                PaletteAction::Downloads,
+            ),
+            (
+                "Settings".to_string(),
+                "Configure the app".to_string(),
+                PaletteAction::Settings,
+            ),
+            (
+                "Refresh".to_string(),
+                "Reload current view (Ctrl+R)".to_string(),
+                PaletteAction::Refresh,
+            ),
+            (
+                "Pause all downloads".to_string(),
+                "Pause all active downloads".to_string(),
+                PaletteAction::PauseAll,
+            ),
+            (
+                "Resume all downloads".to_string(),
+                "Resume all paused downloads".to_string(),
+                PaletteAction::ResumeAll,
+            ),
+            (
+                "Quit".to_string(),
+                "Exit the application".to_string(),
+                PaletteAction::Quit,
+            ),
         ];
     }
 
@@ -1228,6 +1546,7 @@ impl App {
             self.folder_draft = None;
             self.folder_rename = None;
             self.search_save_draft = None;
+            self.view_anim = 0.0;
         }
         self.view = view;
         if view == View::Search && self.search.query.trim().is_empty() {
@@ -1239,12 +1558,7 @@ impl App {
         self.push_toast(text.into(), tone, None);
     }
 
-    fn toast_action(
-        &mut self,
-        text: impl Into<String>,
-        tone: ToastTone,
-        action: ToastAction,
-    ) {
+    fn toast_action(&mut self, text: impl Into<String>, tone: ToastTone, action: ToastAction) {
         self.push_toast(text.into(), tone, Some(action));
     }
 
@@ -1262,7 +1576,7 @@ impl App {
 
     fn export_all(&mut self) {
         use serde_json::json;
-        
+
         let export = json!({
             "version": env!("CARGO_PKG_VERSION"),
             "settings": self.persisted.settings,
@@ -1272,15 +1586,21 @@ impl App {
             "library": self.persisted.library,
             "save_rules": self.persisted.save_rules,
         });
-        
+
         if let Some(path) = rfd::FileDialog::new()
             .set_title("Export DST-Explorer data")
             .add_filter("JSON", &["json"])
-            .set_file_name(&format!("dst-explorer-export-{}.json", chrono::Local::now().format("%Y%m%d")))
+            .set_file_name(&format!(
+                "dst-explorer-export-{}.json",
+                chrono::Local::now().format("%Y%m%d")
+            ))
             .save_file()
         {
             match std::fs::write(&path, serde_json::to_string_pretty(&export).unwrap()) {
-                Ok(_) => self.toast(format!("Exported to {}", path.display()), ToastTone::Success),
+                Ok(_) => self.toast(
+                    format!("Exported to {}", path.display()),
+                    ToastTone::Success,
+                ),
                 Err(e) => self.toast(format!("Export failed: {}", e), ToastTone::Error),
             }
         }
@@ -1293,63 +1613,77 @@ impl App {
             .pick_file()
         {
             match std::fs::read_to_string(&path) {
-                Ok(content) => {
-                    match serde_json::from_str::<serde_json::Value>(&content) {
-                        Ok(import) => {
-                            let mut imported_something = false;
-                            
-                            if let Some(settings) = import.get("settings") {
-                                if let Ok(s) = serde_json::from_value::<crate::models::Settings>(settings.clone()) {
-                                    self.persisted.settings = s;
-                                    imported_something = true;
-                                }
-                            }
-                            
-                            if let Some(watchlist) = import.get("watchlist") {
-                                if let Ok(w) = serde_json::from_value::<Vec<crate::models::Album>>(watchlist.clone()) {
-                                    self.persisted.watchlist = w;
-                                    imported_something = true;
-                                }
-                            }
-                            
-                            if let Some(watch_folders) = import.get("watch_folders") {
-                                if let Ok(w) = serde_json::from_value::<Vec<String>>(watch_folders.clone()) {
-                                    self.persisted.watch_folders = w;
-                                    imported_something = true;
-                                }
-                            }
-                            
-                            if let Some(watch_meta) = import.get("watch_meta") {
-                                if let Ok(w) = serde_json::from_value::<std::collections::HashMap<u64, crate::models::WatchMeta>>(watch_meta.clone()) {
-                                    self.persisted.watch_meta = w;
-                                    imported_something = true;
-                                }
-                            }
-                            
-                            if let Some(library) = import.get("library") {
-                                if let Ok(l) = serde_json::from_value::<Vec<crate::models::LibraryEntry>>(library.clone()) {
-                                    self.persisted.library = l;
-                                    imported_something = true;
-                                }
-                            }
-                            
-                            if let Some(save_rules) = import.get("save_rules") {
-                                if let Ok(r) = serde_json::from_value::<Vec<crate::models::SaveRule>>(save_rules.clone()) {
-                                    self.persisted.save_rules = r;
-                                    imported_something = true;
-                                }
-                            }
-                            
-                            if imported_something {
-                                self.dirty = true;
-                                self.toast(format!("Imported from {}", path.display()), ToastTone::Success);
-                            } else {
-                                self.toast("Import failed: no valid data found", ToastTone::Error);
+                Ok(content) => match serde_json::from_str::<serde_json::Value>(&content) {
+                    Ok(import) => {
+                        let mut imported_something = false;
+
+                        if let Some(settings) = import.get("settings") {
+                            if let Ok(s) =
+                                serde_json::from_value::<crate::models::Settings>(settings.clone())
+                            {
+                                self.persisted.settings = s;
+                                imported_something = true;
                             }
                         }
-                        Err(e) => self.toast(format!("Import failed: {}", e), ToastTone::Error),
+
+                        if let Some(watchlist) = import.get("watchlist") {
+                            if let Ok(w) = serde_json::from_value::<Vec<crate::models::Album>>(
+                                watchlist.clone(),
+                            ) {
+                                self.persisted.watchlist = w;
+                                imported_something = true;
+                            }
+                        }
+
+                        if let Some(watch_folders) = import.get("watch_folders") {
+                            if let Ok(w) =
+                                serde_json::from_value::<Vec<String>>(watch_folders.clone())
+                            {
+                                self.persisted.watch_folders = w;
+                                imported_something = true;
+                            }
+                        }
+
+                        if let Some(watch_meta) = import.get("watch_meta") {
+                            if let Ok(w) = serde_json::from_value::<
+                                std::collections::HashMap<u64, crate::models::WatchMeta>,
+                            >(watch_meta.clone())
+                            {
+                                self.persisted.watch_meta = w;
+                                imported_something = true;
+                            }
+                        }
+
+                        if let Some(library) = import.get("library") {
+                            if let Ok(l) = serde_json::from_value::<Vec<crate::models::LibraryEntry>>(
+                                library.clone(),
+                            ) {
+                                self.persisted.library = l;
+                                imported_something = true;
+                            }
+                        }
+
+                        if let Some(save_rules) = import.get("save_rules") {
+                            if let Ok(r) = serde_json::from_value::<Vec<crate::models::SaveRule>>(
+                                save_rules.clone(),
+                            ) {
+                                self.persisted.save_rules = r;
+                                imported_something = true;
+                            }
+                        }
+
+                        if imported_something {
+                            self.dirty = true;
+                            self.toast(
+                                format!("Imported from {}", path.display()),
+                                ToastTone::Success,
+                            );
+                        } else {
+                            self.toast("Import failed: no valid data found", ToastTone::Error);
+                        }
                     }
-                }
+                    Err(e) => self.toast(format!("Import failed: {}", e), ToastTone::Error),
+                },
                 Err(e) => self.toast(format!("Import failed: {}", e), ToastTone::Error),
             }
         }
@@ -1404,7 +1738,8 @@ impl App {
 
     fn toggle_watch(&mut self, album: Album) {
         let title = album.title.clone();
-        let added = self.persisted.toggle_watch(album);
+        let meta = self.persisted.watch_meta.get(&album.id).cloned();
+        let added = self.persisted.toggle_watch(album.clone());
         self.dirty = true;
         if added {
             self.toast(
@@ -1412,9 +1747,10 @@ impl App {
                 ToastTone::Success,
             );
         } else {
-            self.toast(
+            self.toast_action(
                 format!("Removed “{title}” from your watchlist"),
                 ToastTone::Info,
+                ToastAction::RestoreWatch(album, meta),
             );
         }
     }
@@ -1595,6 +1931,20 @@ impl App {
                 CardAction::Open(album) => self.open_detail(album),
                 CardAction::ToggleSelect { id, shift } => self.toggle_select(id, shift),
                 CardAction::Download(album) => self.queue_download(album),
+                CardAction::Play(album) => {
+                    if let Some(entry) = self
+                        .persisted
+                        .library
+                        .iter()
+                        .find(|entry| entry.album.id == album.id)
+                    {
+                        let folder = entry.folder();
+                        let source = entry.path.clone();
+                        self.play_folder(&folder, &source);
+                    } else {
+                        self.toast("Download this album before playing it.", ToastTone::Info);
+                    }
+                }
                 CardAction::Watch(album) => self.toggle_watch(album),
                 CardAction::SetFolder { album, folder } => {
                     let title = album.title.clone();
@@ -1751,7 +2101,17 @@ impl App {
         let mut navigate = None;
         let cache_text = store::human_size(self.dl_ui.cache_bytes);
         let active = self.downloads.active_count();
-        SidePanelLeft::show(ctx, self, &mut navigate, &cache_text, active);
+        let compact = ctx.screen_rect().width() < 960.0;
+        let target = if self.persisted.settings.sidebar_collapsed || compact {
+            1.0
+        } else {
+            0.0
+        };
+        let anim = approach(&mut self.sidebar_anim, target, self.anim_dt, 16.0);
+        if (anim - target).abs() > 0.001 {
+            ctx.request_repaint();
+        }
+        SidePanelLeft::show(ctx, self, &mut navigate, &cache_text, active, anim);
         if let Some(view) = navigate {
             self.set_view(view);
         }
@@ -1773,6 +2133,10 @@ impl App {
             DETAIL_WIDTH
         };
         let detail_margin = if compact { 16.0 } else { 22.0 };
+        let anim = approach(&mut self.detail_anim, 1.0, self.anim_dt, 15.0);
+        if anim < 1.0 {
+            ctx.request_repaint();
+        }
         let album_id = self
             .detail
             .as_ref()
@@ -1812,6 +2176,11 @@ impl App {
                     bottom: 16.0,
                 }))
                 .show(ctx, |ui| {
+                    ui.set_opacity(0.08 + 0.92 * anim);
+                    let slide = (1.0 - ease_out(anim)) * 14.0;
+                    if slide > 0.2 {
+                        ui.add_space(slide);
+                    }
                     actions = draw_detail(
                         ui,
                         detail,
@@ -1837,6 +2206,7 @@ impl App {
         let mut download = false;
         let mut clear = false;
         let mut select_all = false;
+        let mut copy_links = false;
         let narrow = ctx.available_rect().width() < 560.0;
         let pad = if narrow { 16.0 } else { 28.0 };
         egui::TopBottomPanel::bottom("selection-bar")
@@ -1904,6 +2274,9 @@ impl App {
                             if theme::primary_button(ui, &format!("Download {count}")).clicked() {
                                 download = true;
                             }
+                            if theme::secondary_button(ui, "Copy links").clicked() {
+                                copy_links = true;
+                            }
                         });
                     });
                 } else {
@@ -1923,6 +2296,9 @@ impl App {
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             if theme::primary_button(ui, &format!("Download {count}")).clicked() {
                                 download = true;
+                            }
+                            if theme::secondary_button(ui, "Copy links").clicked() {
+                                copy_links = true;
                             }
                             if ui
                                 .add(
@@ -1962,6 +2338,19 @@ impl App {
         if download {
             self.download_selected();
         }
+        if copy_links {
+            let links: Vec<String> = self
+                .visible_albums()
+                .iter()
+                .filter(|album| self.selection.contains(&album.id))
+                .map(|album| album.page_url())
+                .collect();
+            if links.is_empty() {
+                self.toast("Nothing selected to copy.", ToastTone::Info);
+            } else {
+                self.pending_clipboard = Some(links.join("\n"));
+            }
+        }
         if clear {
             self.selection.clear();
             self.selection_anchor = None;
@@ -1970,12 +2359,29 @@ impl App {
 
     fn draw_player_bar(&mut self, ctx: &egui::Context) {
         self.player.tick();
-        if !self.player.has_track() && self.player.error().is_none() {
+        let show = self.player.has_track() || self.player.error().is_some();
+        let anim = approach(
+            &mut self.player_anim,
+            if show { 1.0 } else { 0.0 },
+            self.anim_dt,
+            14.0,
+        );
+        if anim < 0.01 {
             return;
         }
+        if anim < 1.0 {
+            ctx.request_repaint();
+        }
         let mut stop = false;
+        let album = self.player_album();
+        let cover_key = album.as_ref().map(|album| format!("t{}", album.id));
+        let cover_tex = cover_key
+            .as_deref()
+            .and_then(|key| self.textures.get(key).cloned());
+        let mut need_cover = false;
+        let mut open_album: Option<Album> = None;
         egui::TopBottomPanel::bottom("player-bar")
-            .exact_height(84.0)
+            .exact_height(92.0 * anim)
             .frame(
                 Frame::none()
                     .fill(PANEL())
@@ -1988,7 +2394,44 @@ impl App {
                     }),
             )
             .show(ctx, |ui| {
+                ui.set_opacity(anim);
                 ui.horizontal(|ui| {
+                    let (cover_rect, cover_resp) =
+                        ui.allocate_exact_size(vec2(64.0, 64.0), Sense::click());
+                    let painter = ui.painter();
+                    if let Some(texture) = &cover_tex {
+                        paint_texture_cover(painter, cover_rect, texture, Rounding::same(7.0), 1.0);
+                    } else if let Some(album) = &album {
+                        paint_cover_placeholder(
+                            painter,
+                            cover_rect,
+                            &album.title,
+                            ui.input(|i| i.time) as f32,
+                        );
+                        need_cover = true;
+                    } else {
+                        painter.rect_filled(cover_rect, Rounding::same(7.0), CARD());
+                    }
+                    if cover_resp.hovered() {
+                        painter.rect_filled(
+                            cover_rect,
+                            Rounding::same(7.0),
+                            Color32::from_black_alpha(70),
+                        );
+                        theme::paint_icon(
+                            painter,
+                            Rect::from_center_size(cover_rect.center(), vec2(20.0, 20.0)),
+                            Icon::External,
+                            TEXT(),
+                            1.6,
+                        );
+                    }
+                    if cover_resp.clicked() {
+                        if let Some(album) = &album {
+                            open_album = Some(album.clone());
+                        }
+                    }
+                    ui.add_space(8.0);
                     ui.allocate_ui_with_layout(
                         vec2(200.0, 64.0),
                         Layout::top_down(Align::LEFT),
@@ -2044,6 +2487,49 @@ impl App {
                     if theme::icon_button(ui, Icon::Next, 32.0, MUTED()).clicked() {
                         self.player.next();
                     }
+                    ui.add_space(4.0);
+                    let shuffle_on = self.player.shuffle();
+                    if theme::icon_button(
+                        ui,
+                        Icon::Shuffle,
+                        28.0,
+                        if shuffle_on { accent() } else { MUTED() },
+                    )
+                    .on_hover_text(if shuffle_on {
+                        "Shuffle on"
+                    } else {
+                        "Shuffle off"
+                    })
+                    .clicked()
+                    {
+                        self.persisted.settings.shuffle = !shuffle_on;
+                        self.player.set_shuffle(!shuffle_on);
+                        self.dirty = true;
+                    }
+                    let repeat = self.player.repeat();
+                    let repeat_icon = if repeat == RepeatMode::One {
+                        Icon::RepeatOne
+                    } else {
+                        Icon::Repeat
+                    };
+                    if theme::icon_button(
+                        ui,
+                        repeat_icon,
+                        28.0,
+                        if repeat == RepeatMode::Off {
+                            MUTED()
+                        } else {
+                            accent()
+                        },
+                    )
+                    .on_hover_text(repeat.label())
+                    .clicked()
+                    {
+                        let next = repeat.cycle();
+                        self.persisted.settings.repeat_mode = next;
+                        self.player.set_repeat(next);
+                        self.dirty = true;
+                    }
                     ui.add_space(8.0);
 
                     let time_width = 96.0;
@@ -2061,8 +2547,8 @@ impl App {
                     paint_waveform(ui.painter(), wave_rect, &peaks, progress);
                     if response.clicked() || response.dragged() {
                         if let Some(position) = response.interact_pointer_pos() {
-                            let fraction =
-                                ((position.x - wave_rect.left()) / wave_rect.width()).clamp(0.0, 1.0);
+                            let fraction = ((position.x - wave_rect.left()) / wave_rect.width())
+                                .clamp(0.0, 1.0);
                             self.player.set_position_fraction(fraction);
                         }
                     }
@@ -2098,8 +2584,7 @@ impl App {
                             )
                             .changed()
                         {
-                            self.player
-                                .set_volume(self.persisted.settings.audio_volume);
+                            self.player.set_volume(self.persisted.settings.audio_volume);
                             self.dirty = true;
                         }
                         theme::paint_icon(
@@ -2116,12 +2601,35 @@ impl App {
                     });
                 });
             });
+        if need_cover {
+            if let Some(album) = &album {
+                self.request_images(vec![ImageSpec {
+                    key: format!("t{}", album.id),
+                    url: album.thumb_url(),
+                    cache_path: store::thumb_cache_path(album.id),
+                    max_dim: 420,
+                }]);
+            }
+        }
+        if let Some(album) = open_album {
+            self.open_detail(album);
+        }
         if stop {
             self.player.stop();
         }
         if self.player.is_playing() {
             ctx.request_repaint_after(Duration::from_millis(200));
         }
+    }
+
+    /// Find the library album that owns the currently playing folder.
+    fn player_album(&self) -> Option<Album> {
+        let folder = self.player.queue_folder()?;
+        self.persisted
+            .library
+            .iter()
+            .find(|entry| entry.folder() == folder)
+            .map(|entry| entry.album.clone())
     }
 
     /// Start playback for a library folder, reporting a toast on failure.
@@ -2151,6 +2659,11 @@ impl App {
         } else {
             (28.0, 24.0, 20.0, 18.0)
         };
+        let anim = approach(&mut self.view_anim, 1.0, self.anim_dt, 16.0);
+        let slide = (1.0 - ease_out(anim)) * 12.0;
+        if anim < 1.0 {
+            ctx.request_repaint();
+        }
         egui::CentralPanel::default()
             .frame(Frame::none().fill(BG()).inner_margin(Margin {
                 left: pad_left,
@@ -2158,13 +2671,19 @@ impl App {
                 top: pad_top,
                 bottom: pad_bottom,
             }))
-            .show(ctx, |ui| match self.view {
-                View::Discover => self.view_discover(ui),
-                View::Search => self.view_search(ui),
-                View::Watchlist => self.view_watchlist(ui),
-                View::Library => self.view_library(ui),
-                View::Downloads => self.view_downloads(ui),
-                View::Settings => self.view_settings(ui, ctx),
+            .show(ctx, |ui| {
+                ui.set_opacity(0.1 + 0.9 * anim);
+                if slide > 0.2 {
+                    ui.add_space(slide);
+                }
+                match self.view {
+                    View::Discover => self.view_discover(ui),
+                    View::Search => self.view_search(ui),
+                    View::Watchlist => self.view_watchlist(ui),
+                    View::Library => self.view_library(ui),
+                    View::Downloads => self.view_downloads(ui),
+                    View::Settings => self.view_settings(ui, ctx),
+                }
             });
     }
 
@@ -2183,6 +2702,13 @@ impl App {
                     self.refresh_latest();
                 }
                 if loaded > 0 {
+                    if theme::icon_button(ui, Icon::Dice, 32.0, MUTED())
+                        .on_hover_text("Surprise me")
+                        .clicked()
+                    {
+                        let album = self.latest[random_pick(self.latest.len())].clone();
+                        self.open_detail(album);
+                    }
                     ui.label(
                         egui::RichText::new(format!("{} {}", loaded, self.t("loaded")))
                             .size(11.0)
@@ -2287,6 +2813,7 @@ impl App {
             footer,
             self.persisted.settings.compact_grid,
             &format!("latest-{}", self.latest_gen),
+            self.player.queue_folder(),
         );
         self.request_images(requests);
         let load_more = actions.iter().any(|a| matches!(a, CardAction::LoadMore));
@@ -2354,7 +2881,12 @@ impl App {
                         }
                     }
                     ui.add_space(18.0);
-                    ui.label(egui::RichText::new("FORMAT").size(9.5).strong().color(DIM()));
+                    ui.label(
+                        egui::RichText::new("FORMAT")
+                            .size(9.5)
+                            .strong()
+                            .color(DIM()),
+                    );
                     ui.add_space(2.0);
                     let options = [
                         ("FLAC", self.search.formats.flac),
@@ -2404,7 +2936,12 @@ impl App {
                 .show(ui, |ui| {
                     if !history.is_empty() {
                         ui.horizontal_wrapped(|ui| {
-                            ui.label(egui::RichText::new("RECENT").size(9.5).strong().color(DIM()));
+                            ui.label(
+                                egui::RichText::new("RECENT")
+                                    .size(9.5)
+                                    .strong()
+                                    .color(DIM()),
+                            );
                             ui.add_space(2.0);
                             for entry in &history {
                                 let response = theme::chip(ui, &ellipsize(&entry.text, 28), false);
@@ -2473,9 +3010,14 @@ impl App {
             self.search_save_draft = Some(query.clone());
         }
         if clear_history {
+            let snapshot = self.persisted.search_history.clone();
             if self.persisted.clear_search_history() {
                 self.dirty = true;
-                self.toast("Recent searches cleared.", ToastTone::Info);
+                self.toast_action(
+                    "Recent searches cleared.",
+                    ToastTone::Info,
+                    ToastAction::RestoreSearchHistory(snapshot),
+                );
             }
         }
         if let Some(name) = delete_saved {
@@ -2493,7 +3035,12 @@ impl App {
                 .inner_margin(Margin::symmetric(12.0, 9.0))
                 .show(ui, |ui| {
                     ui.horizontal_wrapped(|ui| {
-                        ui.label(egui::RichText::new("SAVE AS").size(9.5).strong().color(DIM()));
+                        ui.label(
+                            egui::RichText::new("SAVE AS")
+                                .size(9.5)
+                                .strong()
+                                .color(DIM()),
+                        );
                         let width = (ui.available_width() - 150.0).clamp(100.0, 360.0);
                         let response = ui.add_sized(
                             [width, 30.0],
@@ -2566,7 +3113,12 @@ impl App {
         if self.search.searched {
             let mut filters_changed = false;
             ui.horizontal_wrapped(|ui| {
-                ui.label(egui::RichText::new("FILTER").size(9.5).strong().color(DIM()));
+                ui.label(
+                    egui::RichText::new("FILTER")
+                        .size(9.5)
+                        .strong()
+                        .color(DIM()),
+                );
                 ui.add_space(2.0);
                 if theme::chip(ui, "Regex", self.search_regex).clicked() {
                     self.search_regex = !self.search_regex;
@@ -2582,11 +3134,7 @@ impl App {
                             QualityFilter::Lossy,
                         ] {
                             if ui
-                                .selectable_value(
-                                    &mut self.search_quality,
-                                    value,
-                                    value.label(),
-                                )
+                                .selectable_value(&mut self.search_quality, value, value.label())
                                 .changed()
                             {
                                 filters_changed = true;
@@ -2695,6 +3243,11 @@ impl App {
                     );
                     self.view = View::Downloads;
                 }
+                ui.add_space(6.0);
+                if theme::secondary_button(ui, "Surprise me").clicked() {
+                    let album = self.search.display[random_pick(self.search.display.len())].clone();
+                    self.open_detail(album);
+                }
             });
             ui.add_space(8.0);
         }
@@ -2765,6 +3318,7 @@ impl App {
             footer,
             self.persisted.settings.compact_grid,
             &format!("search-{}", self.search.gen),
+            self.player.queue_folder(),
         );
         self.request_images(requests);
         let load_more = actions.iter().any(|a| matches!(a, CardAction::LoadMore));
@@ -2799,32 +3353,38 @@ impl App {
         };
         let mut add_folder = false;
         let download_albums = visible.clone();
-        view_header(ui, self.t("collection"), self.t("watchlist-title"), subtitle, |ui| {
-            if !download_albums.is_empty() {
-                let label = if download_albums.len() == total {
-                    "Download all"
-                } else {
-                    "Download shown"
-                };
-                if theme::secondary_button(ui, label).clicked() {
-                    let count = download_albums.len();
-                    for album in &download_albums {
-                        self.downloads.enqueue(album.clone());
+        view_header(
+            ui,
+            self.t("collection"),
+            self.t("watchlist-title"),
+            subtitle,
+            |ui| {
+                if !download_albums.is_empty() {
+                    let label = if download_albums.len() == total {
+                        "Download all"
+                    } else {
+                        "Download shown"
+                    };
+                    if theme::secondary_button(ui, label).clicked() {
+                        let count = download_albums.len();
+                        for album in &download_albums {
+                            self.downloads.enqueue(album.clone());
+                        }
+                        self.toast(
+                            format!(
+                                "Queued {count} download{}",
+                                if count == 1 { "" } else { "s" }
+                            ),
+                            ToastTone::Success,
+                        );
+                        self.view = View::Downloads;
                     }
-                    self.toast(
-                        format!(
-                            "Queued {count} download{}",
-                            if count == 1 { "" } else { "s" }
-                        ),
-                        ToastTone::Success,
-                    );
-                    self.view = View::Downloads;
                 }
-            }
-            if theme::secondary_button(ui, "New folder").clicked() {
-                add_folder = true;
-            }
-        });
+                if theme::secondary_button(ui, "New folder").clicked() {
+                    add_folder = true;
+                }
+            },
+        );
         if add_folder {
             self.folder_draft = Some(String::new());
         }
@@ -2832,7 +3392,12 @@ impl App {
 
         let folders = self.persisted.watch_folders.clone();
         ui.horizontal_wrapped(|ui| {
-            ui.label(egui::RichText::new("FOLDERS").size(9.5).strong().color(DIM()));
+            ui.label(
+                egui::RichText::new("FOLDERS")
+                    .size(9.5)
+                    .strong()
+                    .color(DIM()),
+            );
             if theme::chip(ui, "All", self.watch_filter == WatchFilter::All).clicked() {
                 self.set_watch_filter(WatchFilter::All);
             }
@@ -3028,6 +3593,7 @@ impl App {
             GridFooter::None,
             self.persisted.settings.compact_grid,
             "watchlist",
+            self.player.queue_folder(),
         );
         self.request_images(requests);
         self.handle_card_actions(actions);
@@ -3042,16 +3608,22 @@ impl App {
             self.t("albums-word"),
             store::human_size(total)
         );
-        view_header(ui, self.t("collection"), self.t("library-title"), subtitle, |ui| {
-            if theme::secondary_button(ui, "Statistics").clicked() {
-                self.stats_open = !self.stats_open;
-            }
-            if theme::secondary_button(ui, self.t("open-downloads-folder")).clicked() {
-                let dir = self.persisted.settings.download_dir.clone();
-                let _ = std::fs::create_dir_all(&dir);
-                store::open_path(&dir);
-            }
-        });
+        view_header(
+            ui,
+            self.t("collection"),
+            self.t("library-title"),
+            subtitle,
+            |ui| {
+                if theme::secondary_button(ui, "Statistics").clicked() {
+                    self.stats_open = !self.stats_open;
+                }
+                if theme::secondary_button(ui, self.t("open-downloads-folder")).clicked() {
+                    let dir = self.persisted.settings.download_dir.clone();
+                    let _ = std::fs::create_dir_all(&dir);
+                    store::open_path(&dir);
+                }
+            },
+        );
         ui.add_space(8.0);
 
         if self.stats_open && count > 0 {
@@ -3078,7 +3650,9 @@ impl App {
                     ui.horizontal_wrapped(|ui| {
                         let stat = |ui: &mut Ui, label: &str, value: String, color: Color32| {
                             ui.vertical(|ui| {
-                                ui.label(egui::RichText::new(value).size(15.0).strong().color(color));
+                                ui.label(
+                                    egui::RichText::new(value).size(15.0).strong().color(color),
+                                );
                                 ui.label(egui::RichText::new(label).size(9.5).color(DIM()));
                             });
                             ui.add_space(18.0);
@@ -3088,7 +3662,12 @@ impl App {
                         stat(ui, "AVERAGE", store::human_size(average), TEXT());
                         stat(ui, "LOSSLESS", format_number(lossless), SUCCESS());
                         stat(ui, "LOSSY", format_number(lossy), MUTED());
-                        stat(ui, "MISSING", format_number(missing), if missing > 0 { DANGER() } else { DIM() });
+                        stat(
+                            ui,
+                            "MISSING",
+                            format_number(missing),
+                            if missing > 0 { DANGER() } else { DIM() },
+                        );
                     });
                 });
             ui.add_space(8.0);
@@ -3098,7 +3677,8 @@ impl App {
         ui.horizontal(|ui| {
             // Format filter
             let formats = self.get_library_formats();
-            let format_label = self.library_format_filter
+            let format_label = self
+                .library_format_filter
                 .as_ref()
                 .map(|f| f.as_str())
                 .unwrap_or("All formats");
@@ -3108,15 +3688,20 @@ impl App {
                 .show_ui(ui, |ui| {
                     ui.selectable_value(&mut self.library_format_filter, None, "All formats");
                     for fmt in &formats {
-                        ui.selectable_value(&mut self.library_format_filter, Some(fmt.clone()), fmt);
+                        ui.selectable_value(
+                            &mut self.library_format_filter,
+                            Some(fmt.clone()),
+                            fmt,
+                        );
                     }
                 });
-            
+
             ui.add_space(8.0);
-            
+
             // Year filter
             let years = self.get_library_years();
-            let year_label = self.library_year_filter
+            let year_label = self
+                .library_year_filter
                 .map(|y| y.to_string())
                 .unwrap_or_else(|| "All years".to_string());
             egui::ComboBox::from_id_salt("library_year_filter")
@@ -3125,13 +3710,20 @@ impl App {
                 .show_ui(ui, |ui| {
                     ui.selectable_value(&mut self.library_year_filter, None, "All years");
                     for year in &years {
-                        ui.selectable_value(&mut self.library_year_filter, Some(*year), year.to_string());
+                        ui.selectable_value(
+                            &mut self.library_year_filter,
+                            Some(*year),
+                            year.to_string(),
+                        );
                     }
                 });
 
             ui.add_space(8.0);
             egui::ComboBox::from_id_salt("library_sort")
-                .selected_text(format!("Sort: {}", self.persisted.settings.library_sort.label()))
+                .selected_text(format!(
+                    "Sort: {}",
+                    self.persisted.settings.library_sort.label()
+                ))
                 .width(140.0)
                 .show_ui(ui, |ui| {
                     for sort in LibrarySort::ALL {
@@ -3144,7 +3736,7 @@ impl App {
                 });
 
             ui.add_space(16.0);
-            
+
             // Search box
             let (rect, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
             theme::paint_icon(ui.painter(), rect, Icon::Search, DIM(), 1.4);
@@ -3157,16 +3749,14 @@ impl App {
                     .hint_text("Filter by title, artist or folder…")
                     .font(FontId::proportional(13.0)),
             );
-            if !self.library_query.is_empty()
-                && theme::small_button(ui, "Clear", DIM()).clicked()
-            {
+            if !self.library_query.is_empty() && theme::small_button(ui, "Clear", DIM()).clicked() {
                 self.library_query.clear();
             }
-            
+
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 // Clear all filters
-                let has_filters = self.library_format_filter.is_some() 
-                    || self.library_year_filter.is_some() 
+                let has_filters = self.library_format_filter.is_some()
+                    || self.library_year_filter.is_some()
                     || !self.library_query.is_empty();
                 if has_filters && theme::small_button(ui, "Clear all", DIM()).clicked() {
                     self.library_format_filter = None;
@@ -3206,15 +3796,13 @@ impl App {
                     || entry.album.title.to_lowercase().contains(&query)
                     || entry.album.artist.to_lowercase().contains(&query)
                     || entry.path.to_string_lossy().to_lowercase().contains(&query);
-                
-                let matches_format = format_filter.as_ref().map_or(true, |f| {
-                    entry.album.format.trim().eq_ignore_ascii_case(f)
-                });
-                
-                let matches_year = year_filter.map_or(true, |y| {
-                    entry.album.year == y
-                });
-                
+
+                let matches_format = format_filter
+                    .as_ref()
+                    .map_or(true, |f| entry.album.format.trim().eq_ignore_ascii_case(f));
+
+                let matches_year = year_filter.map_or(true, |y| entry.album.year == y);
+
                 matches_query && matches_format && matches_year
             })
             .map(|(index, _)| index)
@@ -3285,12 +3873,14 @@ impl App {
                                         cover,
                                         texture,
                                         Rounding::same(8.0),
+                                        1.0,
                                     );
                                 } else {
                                     paint_cover_placeholder(
                                         ui.painter(),
                                         cover,
                                         &entry.album.title,
+                                        ui.input(|i| i.time) as f32,
                                     );
                                     requests.push(ImageSpec {
                                         key: key.clone(),
@@ -3322,7 +3912,11 @@ impl App {
                                                     egui::RichText::new(title)
                                                         .size(13.0)
                                                         .strong()
-                                                        .color(if missing { MUTED() } else { TEXT() }),
+                                                        .color(if missing {
+                                                            MUTED()
+                                                        } else {
+                                                            TEXT()
+                                                        }),
                                                 )
                                                 .sense(Sense::click()),
                                             )
@@ -3406,7 +4000,11 @@ impl App {
                                     {
                                         actions.push(LibraryAction::SendToMpd(entry.folder()));
                                     }
-                                    if (entry.extracted.as_ref().map(|p| p.exists()).unwrap_or(false)
+                                    if (entry
+                                        .extracted
+                                        .as_ref()
+                                        .map(|p| p.exists())
+                                        .unwrap_or(false)
                                         || entry.path.exists())
                                         && theme::icon_button(ui, Icon::Play, 30.0, accent())
                                             .on_hover_text("Play in DST-Explorer")
@@ -3423,7 +4021,13 @@ impl App {
                                     {
                                         actions.push(LibraryAction::Remove(entry.album.id));
                                     }
-                                    if !entry.extracted.as_ref().map(|p| p.exists()).unwrap_or(false) && !entry.path.exists() {
+                                    if !entry
+                                        .extracted
+                                        .as_ref()
+                                        .map(|p| p.exists())
+                                        .unwrap_or(false)
+                                        && !entry.path.exists()
+                                    {
                                         // Don't offer foobar if files don't exist
                                     } else if theme::icon_button(ui, Icon::Folder, 30.0, MUTED())
                                         .on_hover_text("Open folder")
@@ -3457,11 +4061,14 @@ impl App {
                     }
                 }
                 LibraryAction::Remove(album_id) => {
-                    let title = self
+                    let removed = self
                         .persisted
                         .library
                         .iter()
                         .find(|entry| entry.album.id == album_id)
+                        .cloned();
+                    let title = removed
+                        .as_ref()
                         .map(|entry| entry.album.title.clone())
                         .unwrap_or_default();
                     self.persisted
@@ -3469,15 +4076,20 @@ impl App {
                         .retain(|entry| entry.album.id != album_id);
                     self.downloads.forget_done_album(album_id);
                     self.dirty = true;
-                    self.toast(
-                        format!("Removed “{title}” from your library"),
-                        ToastTone::Info,
-                    );
+                    match removed {
+                        Some(entry) => self.toast_action(
+                            format!("Removed “{title}” from your library"),
+                            ToastTone::Info,
+                            ToastAction::RestoreLibrary(entry),
+                        ),
+                        None => self.toast(
+                            format!("Removed “{title}” from your library"),
+                            ToastTone::Info,
+                        ),
+                    }
                 }
                 LibraryAction::PlayInFoobar(path) => self.play_in_foobar2000(&path),
-                LibraryAction::PlayFolder { folder, source } => {
-                    self.play_folder(&folder, &source)
-                }
+                LibraryAction::PlayFolder { folder, source } => self.play_folder(&folder, &source),
                 LibraryAction::SendToMpd(path) => {
                     let host = self.persisted.settings.mpd_host.trim().to_string();
                     if host.is_empty() {
@@ -3488,9 +4100,7 @@ impl App {
                     } else {
                         let port = self.persisted.settings.mpd_port;
                         match mpd_command(&host, port, &format!("add \"{}\"", mpd_escape(&path))) {
-                            Ok(_) => {
-                                self.toast("Added to the MPD queue.", ToastTone::Success)
-                            }
+                            Ok(_) => self.toast("Added to the MPD queue.", ToastTone::Success),
                             Err(error) => self.toast(format!("MPD: {error}"), ToastTone::Error),
                         }
                     }
@@ -3526,34 +4136,44 @@ impl App {
         if failed > 0 {
             parts.push(format!("{failed} {}", self.t("failed")));
         }
-        parts.push(format!("{} {}", self.downloads.tasks.len(), self.t("total-word")));
+        parts.push(format!(
+            "{} {}",
+            self.downloads.tasks.len(),
+            self.t("total-word")
+        ));
         let subtitle = parts.join(" · ");
-        view_header(ui, self.t("downloads-eyebrow"), self.t("downloads-title"), subtitle, |ui| {
-            let running = self.downloads.running_count();
-            let paused = self.downloads.paused_count();
-            let failed = self.downloads.failed_count();
-            if paused > 0
-                && theme::secondary_button(ui, &format!("Resume all ({paused})")).clicked()
-            {
-                self.downloads.resume_all();
-            }
-            if running > 0 && theme::secondary_button(ui, "Pause all").clicked() {
-                self.downloads.pause_all();
-            }
-            if failed > 0
-                && theme::secondary_button(ui, &format!("Retry failed ({failed})")).clicked()
-            {
-                self.downloads.retry_all_failed();
-            }
-            if has_tasks && theme::secondary_button(ui, "Clear finished").clicked() {
-                self.downloads.clear_finished();
-            }
-            if theme::secondary_button(ui, "Open folder").clicked() {
-                let dir = self.persisted.settings.download_dir.clone();
-                let _ = std::fs::create_dir_all(&dir);
-                store::open_path(&dir);
-            }
-        });
+        view_header(
+            ui,
+            self.t("downloads-eyebrow"),
+            self.t("downloads-title"),
+            subtitle,
+            |ui| {
+                let running = self.downloads.running_count();
+                let paused = self.downloads.paused_count();
+                let failed = self.downloads.failed_count();
+                if paused > 0
+                    && theme::secondary_button(ui, &format!("Resume all ({paused})")).clicked()
+                {
+                    self.downloads.resume_all();
+                }
+                if running > 0 && theme::secondary_button(ui, "Pause all").clicked() {
+                    self.downloads.pause_all();
+                }
+                if failed > 0
+                    && theme::secondary_button(ui, &format!("Retry failed ({failed})")).clicked()
+                {
+                    self.downloads.retry_all_failed();
+                }
+                if has_tasks && theme::secondary_button(ui, "Clear finished").clicked() {
+                    self.downloads.clear_finished();
+                }
+                if theme::secondary_button(ui, "Open folder").clicked() {
+                    let dir = self.persisted.settings.download_dir.clone();
+                    let _ = std::fs::create_dir_all(&dir);
+                    store::open_path(&dir);
+                }
+            },
+        );
         ui.add_space(14.0);
 
         if !self.downloads.tasks.is_empty() {
@@ -3563,16 +4183,13 @@ impl App {
                     ui.label(egui::RichText::new("HOSTS").size(9.5).strong().color(DIM()));
                     ui.add_space(2.0);
                     for host in hosts {
-                        let active = self
-                            .downloads
-                            .tasks
-                            .iter()
-                            .any(|task| task.host.as_deref() == Some(host.as_str()) && task.state.is_active());
-                        let paused = self
-                            .downloads
-                            .tasks
-                            .iter()
-                            .any(|task| task.host.as_deref() == Some(host.as_str()) && task.state == DownloadState::Paused);
+                        let active = self.downloads.tasks.iter().any(|task| {
+                            task.host.as_deref() == Some(host.as_str()) && task.state.is_active()
+                        });
+                        let paused = self.downloads.tasks.iter().any(|task| {
+                            task.host.as_deref() == Some(host.as_str())
+                                && task.state == DownloadState::Paused
+                        });
                         let label = if paused && !active {
                             format!("{host} · paused")
                         } else {
@@ -3581,10 +4198,16 @@ impl App {
                         if theme::chip(ui, &label, active).clicked() {
                             if paused && !active {
                                 self.downloads.resume_host(&host);
-                                self.toast(format!("Resumed downloads from {host}."), ToastTone::Info);
+                                self.toast(
+                                    format!("Resumed downloads from {host}."),
+                                    ToastTone::Info,
+                                );
                             } else {
                                 self.downloads.pause_host(&host);
-                                self.toast(format!("Paused downloads from {host}."), ToastTone::Info);
+                                self.toast(
+                                    format!("Paused downloads from {host}."),
+                                    ToastTone::Info,
+                                );
                             }
                         }
                     }
@@ -3594,7 +4217,12 @@ impl App {
         }
 
         ui.horizontal_wrapped(|ui| {
-            ui.label(egui::RichText::new("FILTER").size(9.5).strong().color(DIM()));
+            ui.label(
+                egui::RichText::new("FILTER")
+                    .size(9.5)
+                    .strong()
+                    .color(DIM()),
+            );
             ui.add_space(2.0);
             for filter in DlFilter::ALL {
                 if theme::chip(ui, filter.label(), self.dl_filter == filter).clicked() {
@@ -4600,6 +5228,17 @@ impl App {
                         .size(10.5)
                         .color(DIM()),
                     );
+                    ui.add_space(6.0);
+                    if ui
+                        .checkbox(
+                            &mut self.persisted.settings.remember_position,
+                            egui::RichText::new("Remember playback position and resume on launch")
+                                .size(12.0),
+                        )
+                        .changed()
+                    {
+                        changed = true;
+                    }
                 });
 
                 ui.add_space(14.0);
@@ -4671,7 +5310,7 @@ impl App {
                             .color(DIM()),
                     );
                 });
-                
+
                 ui.add_space(14.0);
                 settings_card(ui, self.t("about"), |ui| {
                     ui.label(
@@ -4762,8 +5401,14 @@ impl App {
     }
 
     fn draw_toasts(&mut self, ctx: &egui::Context) {
-        self.toasts
-            .retain(|toast| toast.created.elapsed() < Duration::from_secs(5));
+        self.toasts.retain(|toast| {
+            let ttl = if toast.action.as_ref().is_some_and(|action| action.is_undo()) {
+                8
+            } else {
+                5
+            };
+            toast.created.elapsed() < Duration::from_secs(ttl)
+        });
         if self.toasts.is_empty() {
             return;
         }
@@ -4771,11 +5416,19 @@ impl App {
             .toasts
             .iter()
             .map(|toast| {
+                let age = toast.created.elapsed().as_secs_f32();
+                let ttl = if toast.action.as_ref().is_some_and(|action| action.is_undo()) {
+                    8.0
+                } else {
+                    5.0
+                };
+                let fade_in = (age / 0.18).min(1.0);
+                let fade_out = ((ttl - age) / 0.35).clamp(0.0, 1.0);
                 (
                     toast.text.clone(),
                     toast.tone,
                     toast.action.clone(),
-                    (toast.created.elapsed().as_secs_f32() / 0.18).min(1.0),
+                    fade_in.min(fade_out),
                 )
             })
             .collect();
@@ -4816,7 +5469,8 @@ impl App {
                                 ui.add_space(2.0);
                                 ui.label(egui::RichText::new(text).size(12.0).color(TEXT()));
                                 if let Some(action) = action {
-                                    if theme::small_button(ui, "Open", accent()).clicked() {
+                                    let label = action.label();
+                                    if theme::small_button(ui, label, accent()).clicked() {
                                         pending = Some(action);
                                     }
                                 }
@@ -4830,6 +5484,44 @@ impl App {
                 ToastAction::OpenFolder(path) => store::open_path(&path),
                 ToastAction::OpenUrl(url) => {
                     let _ = webbrowser::open(&url);
+                }
+                ToastAction::RestoreWatch(album, meta) => {
+                    if !self
+                        .persisted
+                        .watchlist
+                        .iter()
+                        .any(|existing| existing.id == album.id)
+                    {
+                        self.persisted.watchlist.insert(0, album.clone());
+                    }
+                    if let Some(meta) = meta {
+                        self.persisted.watch_meta.insert(album.id, meta);
+                    }
+                    self.dirty = true;
+                    self.toast(
+                        format!("Restored “{}” to your watchlist", album.title),
+                        ToastTone::Success,
+                    );
+                }
+                ToastAction::RestoreLibrary(entry) => {
+                    if !self
+                        .persisted
+                        .library
+                        .iter()
+                        .any(|existing| existing.album.id == entry.album.id)
+                    {
+                        self.persisted.library.insert(0, entry.clone());
+                    }
+                    self.dirty = true;
+                    self.toast(
+                        format!("Restored “{}” to your library", entry.album.title),
+                        ToastTone::Success,
+                    );
+                }
+                ToastAction::RestoreSearchHistory(entries) => {
+                    self.persisted.search_history = entries;
+                    self.dirty = true;
+                    self.toast("Recent searches restored.", ToastTone::Success);
                 }
             }
         }
@@ -4949,7 +5641,12 @@ impl App {
                 } else {
                     let (rect, _) =
                         ui.allocate_exact_size(vec2(max * 0.7, max * 0.7), Sense::hover());
-                    paint_cover_placeholder(ui.painter(), rect, &album.title);
+                    paint_cover_placeholder(
+                        ui.painter(),
+                        rect,
+                        &album.title,
+                        ui.input(|i| i.time) as f32,
+                    );
                     ui.label(
                         egui::RichText::new("Loading cover…")
                             .size(11.0)
@@ -5022,12 +5719,13 @@ impl App {
                 }
 
                 if cycle_down && !self.palette_actions.is_empty() {
-                    self.palette_selected = (self.palette_selected + 1) % self.palette_actions.len();
+                    self.palette_selected =
+                        (self.palette_selected + 1) % self.palette_actions.len();
                 }
                 if cycle_up && !self.palette_actions.is_empty() {
-                    self.palette_selected =
-                        (self.palette_selected + self.palette_actions.len() - 1)
-                            % self.palette_actions.len();
+                    self.palette_selected = (self.palette_selected + self.palette_actions.len()
+                        - 1)
+                        % self.palette_actions.len();
                 }
 
                 ui.add_space(8.0);
@@ -5047,14 +5745,22 @@ impl App {
 
                             let selected = index == self.palette_selected;
                             let bg = if selected {
-                                Color32::from_rgba_unmultiplied(accent().r(), accent().g(), accent().b(), 20)
-                            } else if response.hovered() || ui.rect_contains_pointer(ui.min_rect()) {
+                                Color32::from_rgba_unmultiplied(
+                                    accent().r(),
+                                    accent().g(),
+                                    accent().b(),
+                                    20,
+                                )
+                            } else if response.hovered() || ui.rect_contains_pointer(ui.min_rect())
+                            {
                                 CARD_HOVER()
                             } else {
                                 CARD()
                             };
-                            let (rect, item_response) =
-                                ui.allocate_exact_size(vec2(panel_width - 32.0, 44.0), Sense::click());
+                            let (rect, item_response) = ui.allocate_exact_size(
+                                vec2(panel_width - 32.0, 44.0),
+                                Sense::click(),
+                            );
                             ui.painter().rect_filled(rect, Rounding::same(8.0), bg);
 
                             ui.painter().text(
@@ -5271,9 +5977,34 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        let now = Instant::now();
+        self.anim_dt = (now - self.last_frame).as_secs_f32().clamp(0.0, 0.1);
+        self.last_frame = now;
+        if let Some(text) = self.pending_clipboard.take() {
+            ctx.copy_text(text);
+            self.toast("Copied to clipboard.", ToastTone::Success);
+        }
         ctx.set_zoom_factor(self.persisted.settings.ui_scale.clamp(0.75, 1.75));
         self.ensure_tray(ctx);
         self.handle_tray_actions(ctx);
+        if self.tray.is_some() && self.tray_tooltip_at.elapsed() > Duration::from_secs(3) {
+            let mut text = match (self.player.track_title(), self.player.state()) {
+                (Some(title), PlaybackState::Playing) => format!("▶ {title} — DST-Explorer"),
+                (Some(title), _) => format!("❚❚ {title} — DST-Explorer"),
+                _ => "DST-Explorer".to_string(),
+            };
+            let active = self.downloads.active_count();
+            if active > 0 {
+                text.push_str(&format!(
+                    " · {active} download{}",
+                    if active == 1 { "" } else { "s" }
+                ));
+            }
+            if let Some(tray) = &self.tray {
+                tray.set_tooltip(&text);
+            }
+            self.tray_tooltip_at = Instant::now();
+        }
         self.handle_close_request(ctx);
         self.textures.begin_frame();
         let loaded = self.images.pump(ctx, &mut self.textures, 10);
@@ -5294,23 +6025,28 @@ impl eframe::App for App {
         );
         let notices = self.downloads.poll();
         self.handle_download_notices(notices);
-        
+
         // Update Windows taskbar progress
         #[cfg(all(windows, feature = "taskbar-progress"))]
         {
-            use crate::taskbar::{set_taskbar_progress, set_taskbar_error, set_taskbar_paused, clear_taskbar};
             use crate::downloads::DownloadState;
+            use crate::taskbar::{
+                clear_taskbar, set_taskbar_error, set_taskbar_paused, set_taskbar_progress,
+            };
             use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-            
+
             let mut total_downloaded: u64 = 0;
             let mut total_size: u64 = 0;
             let mut has_active = false;
             let mut has_error = false;
             let mut has_paused = false;
-            
+
             for task in self.downloads.tasks.iter() {
                 match task.state {
-                    DownloadState::Downloading | DownloadState::Resolving | DownloadState::Extracting | DownloadState::Retrying { .. } => {
+                    DownloadState::Downloading
+                    | DownloadState::Resolving
+                    | DownloadState::Extracting
+                    | DownloadState::Retrying { .. } => {
                         has_active = true;
                         total_downloaded += task.progress.downloaded();
                         total_size += task.progress.total();
@@ -5320,12 +6056,12 @@ impl eframe::App for App {
                     _ => {}
                 }
             }
-            
+
             // Get HWND from the frame
             if let Ok(handle) = frame.window_handle() {
                 if let RawWindowHandle::Win32(h) = handle.as_raw() {
                     let hwnd = h.hwnd.get() as *mut std::ffi::c_void;
-                    
+
                     if has_error {
                         set_taskbar_error(hwnd);
                     } else if has_paused && !has_active {
@@ -5357,9 +6093,26 @@ impl eframe::App for App {
         self.draw_command_palette(ctx);
         self.draw_shortcuts_overlay(ctx);
         self.draw_toasts(ctx);
+        self.draw_confetti(ctx);
 
         self.images.pump(ctx, &mut self.textures, 4);
         self.textures.trim(self.persisted.settings.texture_budget);
+
+        // Remember the last played track so it can be resumed on the next launch.
+        if self.persisted.settings.remember_position
+            && self.resume_saved.elapsed() > Duration::from_secs(4)
+        {
+            if let (Some(folder), Some(file)) = (
+                self.player.queue_folder().map(Path::to_path_buf),
+                self.player.current_path().map(Path::to_path_buf),
+            ) {
+                self.persisted.settings.last_track_folder = Some(folder);
+                self.persisted.settings.last_track_path = Some(file);
+                self.persisted.settings.last_track_position = self.player.position();
+                self.dirty = true;
+                self.resume_saved = Instant::now();
+            }
+        }
 
         if self.dirty && self.last_state_save.elapsed() > Duration::from_millis(700) {
             store::save_state(&self.persisted);
@@ -5376,7 +6129,10 @@ impl eframe::App for App {
         if self.had_active_downloads && !has_active {
             if self.persisted.settings.notify_on_complete {
                 self.toast("All downloads complete", ToastTone::Success);
-                self.desktop_notify("All downloads complete", "All queued downloads have finished");
+                self.desktop_notify(
+                    "All downloads complete",
+                    "All queued downloads have finished",
+                );
             }
         }
         self.had_active_downloads = has_active;
@@ -5639,14 +6395,14 @@ fn view_heading(ui: &mut Ui, eyebrow: &str, title: &str, subtitle: &str) {
         );
         ui.add_space(3.0);
         ui.add(
-                egui::Label::new(
-                    egui::RichText::new(title)
-                        .font(FontId::new(27.0, FontFamily::Proportional))
-                        .strong()
-                        .color(TEXT()),
-                )
-                .wrap(),
-            );
+            egui::Label::new(
+                egui::RichText::new(title)
+                    .font(FontId::new(27.0, FontFamily::Proportional))
+                    .strong()
+                    .color(TEXT()),
+            )
+            .wrap(),
+        );
         if !subtitle.is_empty() {
             ui.label(egui::RichText::new(subtitle).size(12.0).color(MUTED()));
         }
@@ -5841,22 +6597,36 @@ impl SidePanelLeft {
         navigate: &mut Option<View>,
         cache_text: &str,
         active: usize,
+        anim: f32,
     ) {
-        let compact = ctx.screen_rect().width() < 960.0;
-        let width = if compact { 72.0 } else { 218.0 };
-        let margin = if compact { 10.0 } else { 14.0 };
+        let compact_screen = ctx.screen_rect().width() < 960.0;
+        let compact = compact_screen || anim > 0.5;
+        let width = 218.0 + (72.0 - 218.0) * anim;
+        let margin = 14.0 + (10.0 - 14.0) * anim;
+        let header_top = 22.0 + (18.0 - 22.0) * anim;
         egui::SidePanel::left("sidebar")
             .exact_width(width)
             .resizable(false)
             .frame(Frame::none().fill(SIDEBAR()).inner_margin(Margin {
                 left: margin,
                 right: margin,
-                top: if compact { 18.0 } else { 22.0 },
+                top: header_top,
                 bottom: 18.0,
             }))
             .show(ctx, |ui| {
                 if compact {
-                    ui.vertical_centered(|ui| app_logo(ui, 36.0));
+                    ui.vertical_centered(|ui| {
+                        app_logo(ui, 36.0);
+                        if !compact_screen {
+                            if theme::icon_button(ui, Icon::Menu, 28.0, DIM())
+                                .on_hover_text("Expand sidebar")
+                                .clicked()
+                            {
+                                app.persisted.settings.sidebar_collapsed = false;
+                                app.dirty = true;
+                            }
+                        }
+                    });
                 } else {
                     ui.horizontal(|ui| {
                         app_logo(ui, 36.0);
@@ -5876,11 +6646,25 @@ impl SidePanelLeft {
                                     .color(accent()),
                             );
                         });
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if theme::icon_button(ui, Icon::Menu, 28.0, DIM())
+                                .on_hover_text("Collapse sidebar")
+                                .clicked()
+                            {
+                                app.persisted.settings.sidebar_collapsed = true;
+                                app.dirty = true;
+                            }
+                        });
                     });
                 }
                 ui.add_space(if compact { 22.0 } else { 28.0 });
                 if !compact {
-                    ui.label(egui::RichText::new(app.t("browse-section")).size(9.5).strong().color(DIM()));
+                    ui.label(
+                        egui::RichText::new(app.t("browse-section"))
+                            .size(9.5)
+                            .strong()
+                            .color(DIM()),
+                    );
                     ui.add_space(7.0);
                 }
                 let items = [
@@ -5898,7 +6682,12 @@ impl SidePanelLeft {
                         app.t("nav-library"),
                         Some(app.persisted.library.len()),
                     ),
-                    (View::Downloads, Icon::Download, app.t("nav-downloads"), Some(active)),
+                    (
+                        View::Downloads,
+                        Icon::Download,
+                        app.t("nav-downloads"),
+                        Some(active),
+                    ),
                 ];
                 for (view, icon, label, badge) in items {
                     if nav_row(ui, app.view == view, icon, label, badge, compact) {
@@ -5981,9 +6770,12 @@ impl SidePanelLeft {
                                 ui.allocate_exact_size(vec2(13.0, 13.0), Sense::hover());
                             ui.painter().circle_filled(rect.center(), 3.0, accent());
                             ui.label(
-                                egui::RichText::new(format!("{active} {}", app.t("downloads-active")))
-                                    .size(10.0)
-                                    .color(MUTED()),
+                                egui::RichText::new(format!(
+                                    "{active} {}",
+                                    app.t("downloads-active")
+                                ))
+                                .size(10.0)
+                                .color(MUTED()),
                             );
                         });
                     }
@@ -6020,6 +6812,7 @@ fn draw_grid(
     footer: GridFooter<'_>,
     compact: bool,
     id_salt: &str,
+    playing_folder: Option<&Path>,
 ) -> (Vec<CardAction>, bool) {
     let avail = (ui.available_width() - 16.0).max(140.0);
     let min_card = if avail < 560.0 { 140.0 } else { MIN_CARD_WIDTH };
@@ -6079,6 +6872,12 @@ fn draw_grid(
                         let album = &albums[index];
                         let watched = watchlist.iter().any(|a| a.id == album.id);
                         let downloaded = library.iter().any(|e| e.album.id == album.id);
+                        let playing = downloaded
+                            && playing_folder.is_some_and(|folder| {
+                                library
+                                    .iter()
+                                    .any(|e| e.album.id == album.id && e.folder() == folder)
+                            });
                         let current_folder = watch_meta
                             .get(&album.id)
                             .and_then(|meta| meta.folder.as_deref());
@@ -6090,6 +6889,7 @@ fn draw_grid(
                             selected.contains(&album.id),
                             watched,
                             downloaded,
+                            playing,
                             current_folder,
                             folders,
                             requests,
@@ -6120,6 +6920,7 @@ fn draw_card(
     selected: bool,
     watched: bool,
     downloaded: bool,
+    playing: bool,
     current_folder: Option<&str>,
     folders: &[String],
     requests: &mut Vec<ImageSpec>,
@@ -6131,19 +6932,31 @@ fn draw_card(
     // The action buttons only exist while the card is hovered. Using the response alone
     // makes them vanish as soon as the pointer is over a button, which causes flicker.
     let hovered = response.hovered() || ui.rect_contains_pointer(rect);
+    let hover_t = ui
+        .ctx()
+        .animate_bool_with_time(Id::new(("card-hover", album.id)), hovered, 0.13);
     let painter = ui.painter().clone();
     let bg = if selected {
         Color32::from_rgb(25, 24, 38)
-    } else if hovered {
-        CARD_HOVER()
     } else {
-        CARD()
+        lerp_color(CARD(), CARD_HOVER(), hover_t)
     };
+    if hover_t > 0.01 {
+        painter.rect_filled(
+            rect.translate(vec2(0.0, 3.0)).expand(1.5),
+            Rounding::same(14.0),
+            Color32::from_black_alpha((55.0 * hover_t) as u8),
+        );
+    }
     painter.rect_filled(rect, Rounding::same(12.0), bg);
     if selected {
         painter.rect_stroke(rect, Rounding::same(12.0), Stroke::new(1.0_f32, accent()));
-    } else if hovered {
-        painter.rect_stroke(rect, Rounding::same(12.0), Stroke::new(1.0_f32, BORDER()));
+    } else if hover_t > 0.01 {
+        painter.rect_stroke(
+            rect,
+            Rounding::same(12.0),
+            Stroke::new(1.0_f32, lerp_color(Color32::TRANSPARENT, BORDER(), hover_t)),
+        );
     }
 
     let cover = Rect::from_min_size(
@@ -6153,10 +6966,14 @@ fn draw_card(
     let key = format!("t{}", album.id);
     let mut action = None;
 
-    if let Some(texture) = textures.get(&key) {
-        paint_texture_cover(&painter, cover, texture, Rounding::same(9.0));
+    if let Some((texture, alpha)) = textures.get_with_fade(&key) {
+        paint_texture_cover(&painter, cover, texture, Rounding::same(9.0), alpha);
+        if alpha < 1.0 {
+            ui.ctx().request_repaint();
+        }
     } else {
-        paint_cover_placeholder(&painter, cover, &album.title);
+        paint_cover_placeholder(&painter, cover, &album.title, ui.input(|i| i.time) as f32);
+        ui.ctx().request_repaint_after(Duration::from_millis(80));
         requests.push(ImageSpec {
             key: key.clone(),
             url: album.thumb_url(),
@@ -6166,11 +6983,11 @@ fn draw_card(
     }
 
     // Subtle hover shade over the image.
-    if hovered {
+    if hover_t > 0.01 {
         painter.rect_filled(
             cover,
             Rounding::same(9.0),
-            Color32::from_rgba_unmultiplied(8, 8, 12, 36),
+            Color32::from_rgba_unmultiplied(8, 8, 12, (36.0 * hover_t) as u8),
         );
     }
 
@@ -6224,6 +7041,35 @@ fn draw_card(
 
     // Hover actions.
     if hovered {
+        if downloaded {
+            let play_rect = Rect::from_center_size(cover.center(), vec2(48.0, 48.0));
+            let play_response =
+                ui.interact(play_rect, ui.id().with(("play", album.id)), Sense::click());
+            let lit = play_response.hovered();
+            painter.circle_filled(
+                play_rect.center(),
+                24.0,
+                if lit {
+                    accent()
+                } else {
+                    Color32::from_black_alpha(165)
+                },
+            );
+            theme::paint_icon(
+                &painter,
+                Rect::from_center_size(play_rect.center(), vec2(22.0, 22.0)),
+                Icon::Play,
+                if lit {
+                    Color32::from_rgb(14, 15, 21)
+                } else {
+                    TEXT()
+                },
+                1.8,
+            );
+            if play_response.clicked() {
+                action = Some(CardAction::Play(album.clone()));
+            }
+        }
         let download_rect =
             Rect::from_min_size(cover.right_top() + vec2(-38.0, 8.0), vec2(30.0, 30.0));
         let download_response = ui.interact(
@@ -6312,6 +7158,27 @@ fn draw_card(
             Color32::from_rgb(14, 15, 21),
             2.0,
         );
+    }
+
+    // Animated equaliser for the album that is currently playing.
+    if playing {
+        let eq_rect = Rect::from_min_size(cover.left_bottom() + vec2(8.0, -84.0), vec2(34.0, 20.0));
+        painter.rect_filled(eq_rect, Rounding::same(6.0), Color32::from_black_alpha(165));
+        let time = ui.input(|i| i.time) as f32;
+        for bar in 0..3 {
+            let level = (time * 5.2 + bar as f32 * 1.9).sin() * 0.5 + 0.5;
+            let height = 5.0 + level * 9.0;
+            let x = eq_rect.left() + 9.0 + bar as f32 * 8.0;
+            painter.rect_filled(
+                Rect::from_min_max(
+                    pos2(x, eq_rect.center().y + 5.0 - height),
+                    pos2(x + 4.0, eq_rect.center().y + 5.0),
+                ),
+                Rounding::same(1.5),
+                accent(),
+            );
+        }
+        ui.ctx().request_repaint_after(Duration::from_millis(90));
     }
 
     if show_new && album.is_new {
@@ -6406,7 +7273,14 @@ fn draw_card(
             ui.menu_button("Download by tag", |ui| {
                 for tag in &album.tags {
                     if ui.button(tag).clicked() {
-                        action = Some(CardAction::OpenUrl(format!("{}/?p=search&type=tags&result={}", crate::models::SITE, percent_encoding::percent_encode(tag.as_bytes(), percent_encoding::NON_ALPHANUMERIC))));
+                        action = Some(CardAction::OpenUrl(format!(
+                            "{}/?p=search&type=tags&result={}",
+                            crate::models::SITE,
+                            percent_encoding::percent_encode(
+                                tag.as_bytes(),
+                                percent_encoding::NON_ALPHANUMERIC
+                            )
+                        )));
                         ui.close_menu();
                     }
                 }
@@ -6415,7 +7289,14 @@ fn draw_card(
         if !album.artist.trim().is_empty() {
             ui.menu_button("Download by artist", |ui| {
                 if ui.button(album.artist.trim()).clicked() {
-                    action = Some(CardAction::OpenUrl(format!("{}/?p=search&type=artist&result={}", crate::models::SITE, percent_encoding::percent_encode(album.artist.trim().as_bytes(), percent_encoding::NON_ALPHANUMERIC))));
+                    action = Some(CardAction::OpenUrl(format!(
+                        "{}/?p=search&type=artist&result={}",
+                        crate::models::SITE,
+                        percent_encoding::percent_encode(
+                            album.artist.trim().as_bytes(),
+                            percent_encoding::NON_ALPHANUMERIC
+                        )
+                    )));
                     ui.close_menu();
                 }
             });
@@ -6467,6 +7348,10 @@ fn draw_card(
             ui.ctx().copy_text(album.title.clone());
             ui.close_menu();
         }
+        if ui.button("Copy album link").clicked() {
+            ui.ctx().copy_text(album.page_url());
+            ui.close_menu();
+        }
         if ui.button("Open album page in browser").clicked() {
             action = Some(CardAction::OpenUrl(album.page_url()));
             ui.close_menu();
@@ -6508,6 +7393,7 @@ fn paint_texture_cover(
     rect: Rect,
     texture: &egui::TextureHandle,
     rounding: Rounding,
+    alpha: f32,
 ) {
     let tex_size = texture.size_vec2();
     if tex_size.x <= 0.0 || tex_size.y <= 0.0 {
@@ -6528,14 +7414,28 @@ fn paint_texture_cover(
             pos2(1.0, (1.0 + visible) * 0.5),
         )
     };
-    let mut shape = egui::epaint::RectShape::filled(rect, rounding, Color32::WHITE);
+    let mut shape = egui::epaint::RectShape::filled(
+        rect,
+        rounding,
+        Color32::from_white_alpha((alpha.clamp(0.0, 1.0) * 255.0) as u8),
+    );
     shape.fill_texture_id = texture.id();
     shape.uv = uv;
     painter.add(shape);
 }
 
-fn paint_cover_placeholder(painter: &egui::Painter, rect: Rect, title: &str) {
+fn paint_cover_placeholder(painter: &egui::Painter, rect: Rect, title: &str, time: f32) {
     painter.rect_filled(rect, Rounding::same(9.0), Color32::from_rgb(25, 26, 37));
+    // Cheap animated shimmer band: no textures, no allocation beyond a rect.
+    let phase = (time * 0.45).fract();
+    let band_width = rect.width() * 0.34;
+    let band_x = rect.left() - band_width + phase * (rect.width() + band_width * 2.0);
+    let band = Rect::from_min_size(pos2(band_x, rect.top()), vec2(band_width, rect.height()));
+    painter.with_clip_rect(rect).rect_filled(
+        band,
+        Rounding::same(9.0),
+        Color32::from_white_alpha(13),
+    );
     let stripe = Rect::from_min_size(rect.left_top(), vec2(rect.width(), 2.0));
     painter.rect_filled(stripe, Rounding::same(1.0), accent_dim(80));
     let initial = title
@@ -6616,10 +7516,8 @@ fn task_row(
                     );
                     if let Some(host) = &task.host {
                         ui.add(
-                            egui::Label::new(
-                                egui::RichText::new(host).size(9.5).color(DIM()),
-                            )
-                            .truncate(),
+                            egui::Label::new(egui::RichText::new(host).size(9.5).color(DIM()))
+                                .truncate(),
                         );
                     }
                 });
@@ -6732,16 +7630,25 @@ fn task_row(
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new(file_name).size(10.8).color(MUTED()));
                         if let Some(folder) = &task.extracted {
-                            ui.label(egui::RichText::new("· extracted").size(10.0).color(SUCCESS()));
+                            ui.label(
+                                egui::RichText::new("· extracted")
+                                    .size(10.0)
+                                    .color(SUCCESS()),
+                            );
                             let _ = folder;
                         }
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             if theme::small_button(ui, "Show in folder", TEXT()).clicked() {
                                 actions.push(TaskAction::OpenFolder(task.id));
                             }
-                            if task.extracted.as_ref().map(|p| p.exists()).unwrap_or(false) || task.output.as_ref().map(|p| p.exists()).unwrap_or(false) {
+                            if task.extracted.as_ref().map(|p| p.exists()).unwrap_or(false)
+                                || task.output.as_ref().map(|p| p.exists()).unwrap_or(false)
+                            {
                                 if theme::small_button(ui, "Play in foobar", TEXT()).clicked() {
-                                    let path = task.extracted.clone().unwrap_or_else(|| task.output.clone().unwrap());
+                                    let path = task
+                                        .extracted
+                                        .clone()
+                                        .unwrap_or_else(|| task.output.clone().unwrap());
                                     actions.push(TaskAction::PlayInFoobar(path));
                                 }
                             }
@@ -6836,7 +7743,10 @@ fn paint_waveform(painter: &egui::Painter, rect: Rect, peaks: &[f32], progress: 
         );
     }
     painter.line_segment(
-        [pos2(play_x, rect.top() + 3.0), pos2(play_x, rect.bottom() - 3.0)],
+        [
+            pos2(play_x, rect.top() + 3.0),
+            pos2(play_x, rect.bottom() - 3.0),
+        ],
         Stroke::new(1.5_f32, accent()),
     );
 }
@@ -6853,7 +7763,12 @@ fn format_eta(seconds: f32) -> String {
 }
 
 fn settings_card(ui: &mut Ui, title: impl Into<String>, contents: impl FnOnce(&mut Ui)) {
-    ui.label(egui::RichText::new(title.into()).size(12.5).strong().color(TEXT()));
+    ui.label(
+        egui::RichText::new(title.into())
+            .size(12.5)
+            .strong()
+            .color(TEXT()),
+    );
     ui.add_space(6.0);
     Frame::none()
         .fill(PANEL())
@@ -6918,10 +7833,25 @@ fn draw_detail(
                 ui.id().with(("detail-cover", album.id)),
                 Sense::click(),
             );
-            if let Some(texture) = textures.get(&cover_key) {
-                paint_texture_cover(ui.painter(), cover_rect, texture, Rounding::same(12.0));
+            if let Some((texture, alpha)) = textures.get_with_fade(&cover_key) {
+                paint_texture_cover(
+                    ui.painter(),
+                    cover_rect,
+                    texture,
+                    Rounding::same(12.0),
+                    alpha,
+                );
+                if alpha < 1.0 {
+                    ui.ctx().request_repaint();
+                }
             } else {
-                paint_cover_placeholder(ui.painter(), cover_rect, &album.title);
+                paint_cover_placeholder(
+                    ui.painter(),
+                    cover_rect,
+                    &album.title,
+                    ui.input(|i| i.time) as f32,
+                );
+                ui.ctx().request_repaint_after(Duration::from_millis(80));
                 requests.push(ImageSpec {
                     key: cover_key.clone(),
                     url: album.cover_url(),
@@ -7040,7 +7970,10 @@ fn draw_detail(
                         ui.menu_button("Download by tag", |ui| {
                             for tag in &album.tags {
                                 if ui.button(tag).clicked() {
-                                    actions.push(DetailAction::Search { text: tag.clone(), kind: crate::models::SearchKind::Tags });
+                                    actions.push(DetailAction::Search {
+                                        text: tag.clone(),
+                                        kind: crate::models::SearchKind::Tags,
+                                    });
                                     ui.close_menu();
                                 }
                             }
@@ -7049,7 +7982,10 @@ fn draw_detail(
                     if !album.artist.trim().is_empty() {
                         ui.menu_button("Download by artist", |ui| {
                             if ui.button(album.artist.trim()).clicked() {
-                                actions.push(DetailAction::Search { text: album.artist.trim().to_string(), kind: crate::models::SearchKind::Artist });
+                                actions.push(DetailAction::Search {
+                                    text: album.artist.trim().to_string(),
+                                    kind: crate::models::SearchKind::Artist,
+                                });
                                 ui.close_menu();
                             }
                         });
@@ -7147,7 +8083,12 @@ fn draw_detail(
                 ui.add_space(15.0);
                 ui.separator();
                 ui.add_space(10.0);
-                ui.label(egui::RichText::new("DETAILS").size(9.5).strong().color(DIM()));
+                ui.label(
+                    egui::RichText::new("DETAILS")
+                        .size(9.5)
+                        .strong()
+                        .color(DIM()),
+                );
                 ui.add_space(6.0);
                 egui::Grid::new("detail-meta-grid")
                     .num_columns(2)
@@ -7211,7 +8152,12 @@ fn draw_detail(
 
                 if !loaded.artists.is_empty() {
                     ui.add_space(12.0);
-                    ui.label(egui::RichText::new("ARTISTS").size(9.5).strong().color(DIM()));
+                    ui.label(
+                        egui::RichText::new("ARTISTS")
+                            .size(9.5)
+                            .strong()
+                            .color(DIM()),
+                    );
                     ui.add_space(5.0);
                     ui.horizontal_wrapped(|ui| {
                         for artist in &loaded.artists {
@@ -7286,26 +8232,20 @@ fn meta_row(ui: &mut Ui, label: &str, value: &str) {
 
 fn shortcut_row(ui: &mut Ui, key: &str, description: &str) {
     ui.horizontal(|ui| {
-        let galley = ui
-            .painter()
-            .layout_no_wrap(key.to_string(), FontId::proportional(11.0), DIM());
+        let galley =
+            ui.painter()
+                .layout_no_wrap(key.to_string(), FontId::proportional(11.0), DIM());
         let key_width = galley.size().x + 16.0;
         let (rect, _) = ui.allocate_exact_size(vec2(key_width, 22.0), Sense::hover());
-        ui.painter().rect_filled(
-            rect,
-            Rounding::same(4.0),
-            Color32::from_rgb(25, 26, 37),
-        );
+        ui.painter()
+            .rect_filled(rect, Rounding::same(4.0), Color32::from_rgb(25, 26, 37));
         ui.painter().rect_stroke(
             rect,
             Rounding::same(4.0),
             Stroke::new(1.0_f32, BORDER_SOFT()),
         );
-        ui.painter().galley(
-            rect.center() - galley.size() * 0.5,
-            galley,
-            MUTED(),
-        );
+        ui.painter()
+            .galley(rect.center() - galley.size() * 0.5, galley, MUTED());
         ui.add_space(12.0);
         ui.label(egui::RichText::new(description).size(11.5).color(TEXT()));
     });
@@ -7336,9 +8276,12 @@ mod tests {
           <entry><title>Atom entry</title><link href="https://example.com/atom"/></entry>
         </feed>"#;
         let items = parse_feed_items(xml);
-        assert_eq!(items, vec![(
-            "Atom entry".to_string(),
-            "https://example.com/atom".to_string()
-        )]);
+        assert_eq!(
+            items,
+            vec![(
+                "Atom entry".to_string(),
+                "https://example.com/atom".to_string()
+            )]
+        );
     }
 }

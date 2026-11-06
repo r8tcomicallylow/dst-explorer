@@ -4,6 +4,8 @@ use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
 
+use std::time::Instant;
+
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use eframe::egui;
 
@@ -191,6 +193,7 @@ fn load_image(
 struct TexEntry {
     handle: egui::TextureHandle,
     last_used: u64,
+    inserted: Instant,
 }
 
 pub struct Textures {
@@ -218,6 +221,7 @@ impl Textures {
             TexEntry {
                 handle,
                 last_used: self.frame,
+                inserted: Instant::now(),
             },
         );
     }
@@ -227,6 +231,16 @@ impl Textures {
         self.entries.get_mut(key).map(|entry| {
             entry.last_used = frame;
             &entry.handle
+        })
+    }
+
+    /// Texture plus a 0..=1 fade-in factor based on how long it has existed.
+    pub fn get_with_fade(&mut self, key: &str) -> Option<(&egui::TextureHandle, f32)> {
+        let frame = self.frame;
+        self.entries.get_mut(key).map(|entry| {
+            entry.last_used = frame;
+            let alpha = (entry.inserted.elapsed().as_secs_f32() / 0.24).clamp(0.0, 1.0);
+            (&entry.handle, alpha)
         })
     }
 

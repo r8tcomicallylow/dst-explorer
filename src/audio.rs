@@ -17,6 +17,8 @@ use std::time::Duration;
 
 use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink};
 
+use crate::models::RepeatMode;
+
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::DecoderOptions;
 use symphonia::core::formats::FormatOptions;
@@ -27,8 +29,8 @@ use symphonia::core::probe::Hint;
 /// File extensions the built-in player tries to open. Symphonia is built with
 /// all codecs/formats, but a short allow-list keeps folder scans predictable.
 pub const AUDIO_EXTENSIONS: &[&str] = &[
-    "flac", "mp3", "m4a", "mp4", "aac", "ogg", "oga", "opus", "wav", "wave", "aiff", "aif",
-    "alac", "ape", "wv", "tta", "dsf", "dff",
+    "flac", "mp3", "m4a", "mp4", "aac", "ogg", "oga", "opus", "wav", "wave", "aiff", "aif", "alac",
+    "ape", "wv", "tta", "dsf", "dff",
 ];
 
 pub fn is_audio_file(path: &Path) -> bool {
@@ -46,11 +48,7 @@ pub fn is_audio_file(path: &Path) -> bool {
 pub fn collect_audio_files(folder: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
     collect_into(folder, &mut files, 0);
-    files.sort_by(|a, b| {
-        natural_key(a)
-            .cmp(&natural_key(b))
-            .then_with(|| a.cmp(b))
-    });
+    files.sort_by(|a, b| natural_key(a).cmp(&natural_key(b)).then_with(|| a.cmp(b)));
     files
 }
 
@@ -123,6 +121,14 @@ pub struct AudioPlayer {
     track_offset: f32,
     /// True when the next track was already appended to the sink.
     prefetched: bool,
+    prefetched_index: Option<usize>,
+    /// Folder the current queue was loaded from (used to find the album cover).
+    queue_folder: Option<PathBuf>,
+    shuffle: bool,
+    repeat: RepeatMode,
+    /// Position to restore when playback next starts.
+    resume_at: f32,
+    rng: u64,
     volume: f32,
     enabled: bool,
     waveform_cache: HashMap<PathBuf, Arc<Waveform>>,
@@ -144,6 +150,12 @@ impl AudioPlayer {
             state: PlaybackState::Stopped,
             track_offset: 0.0,
             prefetched: false,
+            prefetched_index: None,
+            queue_folder: None,
+            shuffle: false,
+            repeat: RepeatMode::Off,
+            resume_at: 0.0,
+            rng: seed_rng(),
             volume: volume.clamp(0.0, 1.5),
             enabled,
             waveform_cache: HashMap::new(),
@@ -166,6 +178,30 @@ impl AudioPlayer {
         if let Some(sink) = &self.sink {
             sink.set_volume(self.volume);
         }
+    }
+
+    pub fn set_shuffle(&mut self, shuffle: bool) {
+        self.shuffle = shuffle;
+    }
+
+    pub fn shuffle(&self) -> bool {
+        self.shuffle
+    }
+
+    pub fn set_repeat(&mut self, repeat: RepeatMode) {
+        self.repeat = repeat;
+    }
+
+    pub fn repeat(&self) -> RepeatMode {
+        self.repeat
+    }
+
+    pub fn queue_folder(&self) -> Option<&Path> {
+        self.queue_folder.as_deref()
+    }
+
+    pub fn current_path(&self) -> Option<&Path> {
+        self.track().map(|track| track.path.as_path())
     }
 
     pub fn error(&self) -> Option<&str> {
@@ -216,7 +252,7 @@ impl AudioPlayer {
         self.sink
             .as_ref()
             .map(|sink| (sink.get_pos().as_secs_f32() - self.track_offset).max(0.0))
-            .unwrap_or(0.0)
+            .unwrap_or(self.resume_at)
     }
 
     pub fn progress(&self) -> f32 {
@@ -252,9 +288,48 @@ impl AudioPlayer {
             })
             .collect();
         let count = self.queue.len();
+        self.queue_folder = Some(folder.to_path_buf());
         self.current = Some(0);
+        self.resume_at = 0.0;
         self.start_current()?;
         Ok(count)
+    }
+
+    /// Load a folder without starting playback, restoring a previous track.
+    pub fn prepare_folder(
+        &mut self,
+        folder: &Path,
+        file: &Path,
+        position: f32,
+    ) -> Result<(), String> {
+        let files = collect_audio_files(folder);
+        if files.is_empty() {
+            return Err("No playable audio files in this folder.".to_string());
+        }
+        self.queue = files
+            .into_iter()
+            .map(|path| Track {
+                title: track_title(&path),
+                duration: probe_duration(&path).unwrap_or_default(),
+                path,
+            })
+            .collect();
+        self.current = Some(
+            self.queue
+                .iter()
+                .position(|track| track.path == file)
+                .unwrap_or(0),
+        );
+        self.queue_folder = Some(folder.to_path_buf());
+        self.resume_at = position.max(0.0);
+        self.track_offset = 0.0;
+        self.prefetched = false;
+        self.prefetched_index = None;
+        if let Some(sink) = self.sink.take() {
+            sink.stop();
+        }
+        self.state = PlaybackState::Stopped;
+        Ok(())
     }
 
     /// Play a single file, replacing the queue.
@@ -267,7 +342,9 @@ impl AudioPlayer {
             duration: probe_duration(path).unwrap_or_default(),
             path: path.to_path_buf(),
         }];
+        self.queue_folder = path.parent().map(Path::to_path_buf);
         self.current = Some(0);
+        self.resume_at = 0.0;
         self.start_current()
     }
 
@@ -309,14 +386,49 @@ impl AudioPlayer {
         self.queue.clear();
         self.track_offset = 0.0;
         self.prefetched = false;
+        self.prefetched_index = None;
+        self.resume_at = 0.0;
+    }
+
+    fn random_index(&mut self, avoid: usize) -> Option<usize> {
+        if self.queue.is_empty() {
+            return None;
+        }
+        if self.queue.len() == 1 {
+            return Some(0);
+        }
+        let mut index;
+        for _ in 0..16 {
+            self.rng ^= self.rng << 13;
+            self.rng ^= self.rng >> 7;
+            self.rng ^= self.rng << 17;
+            index = (self.rng as usize) % self.queue.len();
+            if index != avoid {
+                return Some(index);
+            }
+        }
+        Some((avoid + 1) % self.queue.len())
+    }
+
+    fn next_index(&mut self, current: usize, manual: bool) -> Option<usize> {
+        if self.shuffle {
+            return self.random_index(current);
+        }
+        if current + 1 < self.queue.len() {
+            return Some(current + 1);
+        }
+        if self.repeat == RepeatMode::All || (!manual && self.repeat == RepeatMode::One) {
+            return Some(0);
+        }
+        None
     }
 
     pub fn next(&mut self) {
         let Some(current) = self.current else {
             return;
         };
-        if current + 1 < self.queue.len() {
-            self.current = Some(current + 1);
+        if let Some(next) = self.next_index(current, true) {
+            self.current = Some(next);
             let _ = self.start_current();
         } else {
             self.stop();
@@ -338,10 +450,11 @@ impl AudioPlayer {
     }
 
     pub fn seek(&mut self, seconds: f32) -> Result<(), String> {
+        let target = seconds.max(0.0);
         if self.sink.is_none() {
+            self.resume_at = target;
             return Ok(());
         }
-        let target = seconds.max(0.0);
         // Seeking inside a pre-fetched queue is unreliable across all backends;
         // rebuild the current track at the requested offset instead.
         if self.prefetched {
@@ -373,24 +486,36 @@ impl AudioPlayer {
         if self.state != PlaybackState::Playing {
             return;
         }
-        let Some(sink) = &self.sink else {
-            return;
+        let (absolute, elapsed, duration, empty) = {
+            let Some(sink) = &self.sink else {
+                return;
+            };
+            let absolute = sink.get_pos().as_secs_f32();
+            let elapsed = (absolute - self.track_offset).max(0.0);
+            (absolute, elapsed, self.duration(), sink.empty())
         };
-        let absolute = sink.get_pos().as_secs_f32();
-        let elapsed = (absolute - self.track_offset).max(0.0);
-        let duration = self.duration();
         let Some(current) = self.current else {
             return;
         };
-        let has_next = current + 1 < self.queue.len();
 
         // Append the next track slightly before the current one ends. The sink
         // plays both decoders back-to-back without a gap.
-        if !self.prefetched && has_next && duration > 0.0 && elapsed > duration - 1.5 {
-            if let Some(next) = self.queue.get(current + 1) {
-                if let Some(decoder) = open_decoder(&next.path) {
-                    sink.append(decoder);
-                    self.prefetched = true;
+        if !self.prefetched
+            && self.repeat != RepeatMode::One
+            && duration > 0.0
+            && elapsed > duration - 1.5
+        {
+            if let Some(next) = self.next_index(current, false) {
+                if next != current {
+                    if let Some(track) = self.queue.get(next) {
+                        if let Some(decoder) = open_decoder(&track.path) {
+                            if let Some(sink) = &self.sink {
+                                sink.append(decoder);
+                            }
+                            self.prefetched = true;
+                            self.prefetched_index = Some(next);
+                        }
+                    }
                 }
             }
         }
@@ -398,17 +523,32 @@ impl AudioPlayer {
         let finished = if duration > 0.0 {
             elapsed + 0.05 >= duration
         } else {
-            sink.empty()
+            empty
         };
         if finished {
-            if has_next {
-                self.current = Some(current + 1);
-                self.track_offset = absolute;
-                self.prefetched = false;
-                if let Some(next) = self.queue.get(current + 1) {
-                    self.request_waveform(next.path.clone());
+            if self.repeat == RepeatMode::One {
+                let _ = self.start_current();
+                return;
+            }
+            let next = self
+                .prefetched_index
+                .take()
+                .or_else(|| self.next_index(current, false));
+            if let Some(next) = next {
+                if next == current {
+                    let _ = self.start_current();
+                } else if self.prefetched {
+                    self.current = Some(next);
+                    self.track_offset = absolute;
+                    self.prefetched = false;
+                    if let Some(track) = self.queue.get(next) {
+                        self.request_waveform(track.path.clone());
+                    }
+                } else {
+                    self.current = Some(next);
+                    let _ = self.start_current();
                 }
-            } else if sink.empty() {
+            } else if empty {
                 self.state = PlaybackState::Stopped;
             }
         }
@@ -493,6 +633,8 @@ impl AudioPlayer {
                 return Err(self.error.clone().unwrap_or_default());
             }
         };
+        let offset = offset.max(self.resume_at);
+        self.resume_at = 0.0;
         sink.set_volume(self.volume);
         sink.append(decoder);
         if let Some(previous) = self.sink.take() {
@@ -502,6 +644,7 @@ impl AudioPlayer {
         self.state = PlaybackState::Playing;
         self.track_offset = 0.0;
         self.prefetched = false;
+        self.prefetched_index = None;
         self.error = None;
         if offset > 0.0 {
             let _ = self
@@ -513,6 +656,15 @@ impl AudioPlayer {
         self.request_waveform(track.path);
         Ok(())
     }
+}
+
+fn seed_rng() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos() as u64)
+        .unwrap_or(0x9E37_79B9_7F4A_7C15);
+    nanos | 1
 }
 
 fn open_decoder(path: &Path) -> Option<Decoder<BufReader<File>>> {
@@ -663,7 +815,11 @@ mod tests {
         let path = std::env::temp_dir().join("dst-explorer-audio-test.wav");
         write_test_wav(&path);
         let waveform = analyze(&path).expect("wav should decode");
-        assert!((waveform.duration - 2.0).abs() < 0.1, "duration {}", waveform.duration);
+        assert!(
+            (waveform.duration - 2.0).abs() < 0.1,
+            "duration {}",
+            waveform.duration
+        );
         assert!(!waveform.peaks.is_empty());
         assert!(waveform.peaks.iter().all(|peak| (0.0..=1.0).contains(peak)));
         let _ = std::fs::remove_file(path);

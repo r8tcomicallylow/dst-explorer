@@ -28,7 +28,11 @@ macro_rules! palette {
     };
 }
 
-palette!(BG, Color32::from_rgb(11, 12, 17), Color32::from_rgb(245, 244, 249));
+palette!(
+    BG,
+    Color32::from_rgb(11, 12, 17),
+    Color32::from_rgb(245, 244, 249)
+);
 palette!(
     SIDEBAR,
     Color32::from_rgb(15, 16, 23),
@@ -356,6 +360,11 @@ pub enum Icon {
     Previous,
     Next,
     Volume,
+    Shuffle,
+    Repeat,
+    RepeatOne,
+    Dice,
+    Menu,
 }
 
 pub fn icon_button(ui: &mut egui::Ui, icon: Icon, size: f32, tint: Color32) -> Response {
@@ -553,12 +562,18 @@ pub fn paint_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color3
         }
         Icon::Pause => {
             painter.rect_filled(
-                Rect::from_min_size(pt(0.28, 0.2), vec2(rect.width() * 0.16, rect.height() * 0.6)),
+                Rect::from_min_size(
+                    pt(0.28, 0.2),
+                    vec2(rect.width() * 0.16, rect.height() * 0.6),
+                ),
                 Rounding::same(1.5),
                 color,
             );
             painter.rect_filled(
-                Rect::from_min_size(pt(0.56, 0.2), vec2(rect.width() * 0.16, rect.height() * 0.6)),
+                Rect::from_min_size(
+                    pt(0.56, 0.2),
+                    vec2(rect.width() * 0.16, rect.height() * 0.6),
+                ),
                 Rounding::same(1.5),
                 color,
             );
@@ -589,7 +604,14 @@ pub fn paint_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color3
         }
         Icon::Volume => {
             painter.add(Shape::convex_polygon(
-                vec![pt(0.12, 0.38), pt(0.32, 0.38), pt(0.52, 0.2), pt(0.52, 0.8), pt(0.32, 0.62), pt(0.12, 0.62)],
+                vec![
+                    pt(0.12, 0.38),
+                    pt(0.32, 0.38),
+                    pt(0.52, 0.2),
+                    pt(0.52, 0.8),
+                    pt(0.32, 0.62),
+                    pt(0.12, 0.62),
+                ],
                 color,
                 Stroke::NONE,
             ));
@@ -601,6 +623,66 @@ pub fn paint_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color3
                 vec![pt(0.76, 0.22), pt(0.9, 0.5), pt(0.76, 0.78)],
                 Stroke::new(width * 1.1, color),
             ));
+        }
+        Icon::Shuffle => {
+            painter.add(Shape::line(
+                vec![pt(0.12, 0.3), pt(0.38, 0.3), pt(0.62, 0.7), pt(0.84, 0.7)],
+                stroke,
+            ));
+            painter.add(Shape::line(
+                vec![pt(0.12, 0.7), pt(0.38, 0.7), pt(0.62, 0.3), pt(0.84, 0.3)],
+                stroke,
+            ));
+            painter.add(Shape::line(
+                vec![pt(0.72, 0.18), pt(0.88, 0.3), pt(0.72, 0.42)],
+                stroke,
+            ));
+            painter.add(Shape::line(
+                vec![pt(0.72, 0.58), pt(0.88, 0.7), pt(0.72, 0.82)],
+                stroke,
+            ));
+        }
+        Icon::Repeat | Icon::RepeatOne => {
+            painter.add(Shape::line(
+                vec![pt(0.18, 0.66), pt(0.18, 0.34), pt(0.78, 0.34)],
+                stroke,
+            ));
+            painter.add(Shape::line(
+                vec![pt(0.66, 0.2), pt(0.82, 0.34), pt(0.66, 0.48)],
+                stroke,
+            ));
+            painter.add(Shape::line(
+                vec![pt(0.82, 0.34), pt(0.82, 0.66), pt(0.22, 0.66)],
+                stroke,
+            ));
+            painter.add(Shape::line(
+                vec![pt(0.34, 0.52), pt(0.18, 0.66), pt(0.34, 0.8)],
+                stroke,
+            ));
+            if icon == Icon::RepeatOne {
+                painter.text(
+                    center,
+                    egui::Align2::CENTER_CENTER,
+                    "1",
+                    egui::FontId::proportional(rect.height() * 0.4),
+                    color,
+                );
+            }
+        }
+        Icon::Dice => {
+            painter.rect_stroke(
+                rect.shrink(rect.width() * 0.14),
+                Rounding::same(3.0),
+                stroke,
+            );
+            for (x, y) in [(0.34, 0.34), (0.5, 0.5), (0.66, 0.66)] {
+                painter.circle_filled(pt(x, y), width * 1.05, color);
+            }
+        }
+        Icon::Menu => {
+            for y in [0.3, 0.5, 0.7] {
+                painter.line_segment([pt(0.18, y), pt(0.82, y)], stroke);
+            }
         }
     }
 }
