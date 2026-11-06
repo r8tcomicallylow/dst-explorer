@@ -202,6 +202,48 @@ impl AvailabilityFilter {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DlFilter {
+    All,
+    Active,
+    Paused,
+    Failed,
+    Done,
+}
+
+impl DlFilter {
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => "All",
+            Self::Active => "Active",
+            Self::Paused => "Paused",
+            Self::Failed => "Failed",
+            Self::Done => "Done",
+        }
+    }
+
+    fn matches(self, state: DownloadState) -> bool {
+        match self {
+            Self::All => true,
+            Self::Active => state.is_active(),
+            Self::Paused => state == DownloadState::Paused,
+            Self::Failed => matches!(
+                state,
+                DownloadState::Failed | DownloadState::Manual | DownloadState::Cancelled
+            ),
+            Self::Done => state == DownloadState::Done,
+        }
+    }
+
+    const ALL: [Self; 5] = [
+        Self::All,
+        Self::Active,
+        Self::Paused,
+        Self::Failed,
+        Self::Done,
+    ];
+}
+
 enum TaskAction {
     Pause(u64),
     Resume(u64),
@@ -222,6 +264,7 @@ enum LibraryAction {
     OpenFolder(PathBuf),
     Remove(u64),
     PlayInFoobar(PathBuf),
+    SendToMpd(PathBuf),
 }
 
 struct Toast {
@@ -313,6 +356,8 @@ pub struct App {
     notified_matches: HashSet<(String, u64)>,
     rss_draft: String,
     rss_checked: bool,
+    dl_query: String,
+    dl_filter: DlFilter,
     watch_filter: WatchFilter,
     folder_draft: Option<String>,
     folder_rename: Option<(String, String)>,
@@ -395,6 +440,8 @@ impl App {
             notified_matches: HashSet::new(),
             rss_draft: String::new(),
             rss_checked: false,
+            dl_query: String::new(),
+            dl_filter: DlFilter::All,
             watch_filter: WatchFilter::All,
             folder_draft: None,
             folder_rename: None,
@@ -3104,6 +3151,12 @@ impl App {
                                 );
 
                                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    if theme::small_button(ui, "MPD", MUTED)
+                                        .on_hover_text("Add this folder to the MPD queue")
+                                        .clicked()
+                                    {
+                                        actions.push(LibraryAction::SendToMpd(entry.folder()));
+                                    }
                                     if theme::icon_button(ui, Icon::Trash, 30.0, MUTED)
                                         .on_hover_text("Remove from library")
                                         .clicked()
@@ -3162,6 +3215,23 @@ impl App {
                     );
                 }
                 LibraryAction::PlayInFoobar(path) => self.play_in_foobar2000(&path),
+                LibraryAction::SendToMpd(path) => {
+                    let host = self.persisted.settings.mpd_host.trim().to_string();
+                    if host.is_empty() {
+                        self.toast(
+                            "Set your MPD host in Settings → Integrations first.",
+                            ToastTone::Error,
+                        );
+                    } else {
+                        let port = self.persisted.settings.mpd_port;
+                        match mpd_command(&host, port, &format!("add \"{}\"", mpd_escape(&path))) {
+                            Ok(_) => {
+                                self.toast("Added to the MPD queue.", ToastTone::Success)
+                            }
+                            Err(error) => self.toast(format!("MPD: {error}"), ToastTone::Error),
+                        }
+                    }
+                }
             }
         }
     }
@@ -3260,6 +3330,30 @@ impl App {
             }
         }
 
+        ui.horizontal_wrapped(|ui| {
+            ui.label(egui::RichText::new("FILTER").size(9.5).strong().color(DIM));
+            ui.add_space(2.0);
+            for filter in DlFilter::ALL {
+                if theme::chip(ui, filter.label(), self.dl_filter == filter).clicked() {
+                    self.dl_filter = filter;
+                }
+            }
+            ui.add_space(12.0);
+            let width = (ui.available_width() - 40.0).max(120.0);
+            ui.add_sized(
+                [width, 24.0],
+                TextEdit::singleline(&mut self.dl_query)
+                    .id(Id::new("dl-filter"))
+                    .frame(false)
+                    .hint_text("Filter queue by title, artist or host…")
+                    .font(FontId::proportional(12.0)),
+            );
+            if !self.dl_query.is_empty() && theme::small_button(ui, "Clear", DIM).clicked() {
+                self.dl_query.clear();
+            }
+        });
+        ui.add_space(8.0);
+
         if self.downloads.tasks.is_empty() {
             draw_empty(
                 ui,
@@ -3272,7 +3366,29 @@ impl App {
             return;
         }
 
+        let query = self.dl_query.trim().to_lowercase();
+        let filter = self.dl_filter;
         let tasks = &self.downloads.tasks;
+        let visible: Vec<usize> = tasks
+            .iter()
+            .enumerate()
+            .filter(|(_, task)| {
+                if !filter.matches(task.state) {
+                    return false;
+                }
+                if query.is_empty() {
+                    return true;
+                }
+                task.album.title.to_lowercase().contains(&query)
+                    || task.album.artist.to_lowercase().contains(&query)
+                    || task
+                        .host
+                        .as_deref()
+                        .map(|host| host.to_lowercase().contains(&query))
+                        .unwrap_or(false)
+            })
+            .map(|(index, _)| index)
+            .collect();
         let speeds = &mut self.dl_ui.speeds;
         let now = Instant::now();
         for task in tasks {
@@ -3293,19 +3409,30 @@ impl App {
             }
         }
 
-        let mut actions = Vec::new();
-        ScrollArea::vertical()
-            .id_salt("downloads-list")
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                for index in 0..tasks.len() {
-                    let task = &tasks[index];
-                    let speed = speeds.get(&task.id).map(|(_, _, s)| *s).unwrap_or(0.0);
-                    task_row(ui, task, speed, &mut actions);
-                    ui.add_space(10.0);
-                }
-            });
-        self.handle_task_actions(actions);
+        if visible.is_empty() {
+            draw_empty(
+                ui,
+                Icon::Search,
+                "No downloads match this filter",
+                "Clear the filter or pick another status.",
+                None,
+                &mut false,
+            );
+        } else {
+            let mut actions = Vec::new();
+            ScrollArea::vertical()
+                .id_salt("downloads-list")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    for index in visible {
+                        let task = &tasks[index];
+                        let speed = speeds.get(&task.id).map(|(_, _, s)| *s).unwrap_or(0.0);
+                        task_row(ui, task, speed, &mut actions);
+                        ui.add_space(10.0);
+                    }
+                });
+            self.handle_task_actions(actions);
+        }
 
         if self.downloads.running_count() > 0 {
             ui.ctx().request_repaint_after(Duration::from_millis(180));
@@ -4137,6 +4264,58 @@ impl App {
                 });
 
                 ui.add_space(14.0);
+                settings_card(ui, "Integrations", |ui| {
+                    ui.label(
+                        egui::RichText::new("MPD server")
+                            .size(12.0)
+                            .color(MUTED),
+                    );
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        ui.add_sized(
+                            [180.0, 26.0],
+                            TextEdit::singleline(&mut self.persisted.settings.mpd_host)
+                                .hint_text("hostname (empty = disabled)"),
+                        );
+                        ui.label("Port");
+                        if ui
+                            .add(
+                                egui::DragValue::new(&mut self.persisted.settings.mpd_port)
+                                    .range(1..=65_535),
+                            )
+                            .changed()
+                        {
+                            changed = true;
+                        }
+                        if theme::secondary_button(ui, "Test connection").clicked() {
+                            let host = self.persisted.settings.mpd_host.trim().to_string();
+                            if host.is_empty() {
+                                self.toast("Enter an MPD host first.", ToastTone::Error);
+                            } else {
+                                match mpd_command(
+                                    &host,
+                                    self.persisted.settings.mpd_port,
+                                    "status",
+                                ) {
+                                    Ok(_) => self.toast("MPD connection works.", ToastTone::Success),
+                                    Err(error) => {
+                                        self.toast(format!("MPD: {error}"), ToastTone::Error)
+                                    }
+                                }
+                            }
+                        }
+                    });
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "Use the MPD button in your library to add a folder to the player queue.",
+                        )
+                        .size(10.5)
+                        .color(DIM),
+                    );
+                });
+
+                ui.add_space(14.0);
                 settings_card(ui, self.t("import-export"), |ui| {
                     ui.horizontal(|ui| {
                         if theme::secondary_button(ui, self.t("export-all")).clicked() {
@@ -4892,6 +5071,65 @@ fn toggle_format(formats: &mut FormatFilter, label: &str) {
         _ => return,
     };
     *slot = !*slot;
+}
+
+fn mpd_escape(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+}
+
+/// Send a single command to an MPD server and collect its response lines.
+fn mpd_command(host: &str, port: u16, command: &str) -> Result<Vec<String>, String> {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::{TcpStream, ToSocketAddrs};
+
+    let addrs = (host, port)
+        .to_socket_addrs()
+        .map_err(|error| format!("cannot resolve {host}: {error}"))?;
+    let mut stream = None;
+    for addr in addrs {
+        if let Ok(candidate) = TcpStream::connect_timeout(&addr, Duration::from_secs(4)) {
+            stream = Some(candidate);
+            break;
+        }
+    }
+    let mut stream = stream.ok_or_else(|| format!("cannot connect to {host}:{port}"))?;
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+
+    let mut reader = BufReader::new(stream.try_clone().map_err(|error| error.to_string())?);
+    let mut line = String::new();
+    reader
+        .read_line(&mut line)
+        .map_err(|error| error.to_string())?; // greeting: OK MPD <version>
+
+    stream
+        .write_all(command.as_bytes())
+        .and_then(|_| stream.write_all(b"\n"))
+        .map_err(|error| error.to_string())?;
+    stream.flush().ok();
+
+    let mut lines = Vec::new();
+    loop {
+        line.clear();
+        if reader
+            .read_line(&mut line)
+            .map_err(|error| error.to_string())?
+            == 0
+        {
+            break;
+        }
+        let trimmed = line.trim_end().to_string();
+        if let Some(ack) = trimmed.strip_prefix("ACK ") {
+            return Err(ack.to_string());
+        }
+        if trimmed == "OK" {
+            break;
+        }
+        lines.push(trimmed);
+    }
+    let _ = stream.write_all(b"close\n");
+    Ok(lines)
 }
 
 fn parse_feed_items(text: &str) -> Vec<(String, String)> {

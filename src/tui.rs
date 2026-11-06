@@ -6,7 +6,7 @@
 
 use std::io::{self, Write};
 
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{cursor, execute, queue, style};
 
@@ -53,14 +53,21 @@ pub fn run() -> Result<(), String> {
 
     loop {
         draw(&albums, selected, &status)?;
+        if !event::poll(std::time::Duration::from_millis(250))
+            .map_err(|error| error.to_string())?
+        {
+            continue;
+        }
         let event = event::read().map_err(|error| error.to_string())?;
         let Event::Key(key) = event else {
             continue;
         };
-        if key.kind != KeyEventKind::Press {
+        log_key(&key);
+        if key.kind == KeyEventKind::Release {
             continue;
         }
         match key.code {
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return Ok(()),
             KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
             KeyCode::Up | KeyCode::Char('k') => {
                 selected = selected.saturating_sub(1);
@@ -204,4 +211,21 @@ fn truncate(text: &str, max: usize) -> String {
     let mut out: String = text.chars().take(max.saturating_sub(1)).collect();
     out.push('…');
     out
+}
+
+fn log_key(key: &KeyEvent) {
+    let Some(path) = std::env::var_os("DST_EXPLORER_TUI_LOG") else {
+        return;
+    };
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(
+            file,
+            "key={:?} kind={:?} mods={:?}",
+            key.code, key.kind, key.modifiers
+        );
+    }
 }
