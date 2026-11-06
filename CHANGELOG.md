@@ -22,6 +22,9 @@ All notable changes to this project will be documented in this format.
 - Fixed TUI keyboard input in release builds by reopening `CONIN$`/`CONOUT$` after attaching to the parent console
 - Command palette, cheat sheet, F11 fullscreen, Ctrl+Alt+P/R pause/resume and Ctrl+Alt+T accent cycling
 - External player fallback to the system handler and improved WCAG contrast for muted text
+- Built-in audio preview player (rodio + Symphonia): album/folder queue, gapless pre-roll, seek, pause/stop,
+  volume and background waveform extraction, with library/detail play buttons and player hotkeys
+- True light/dark theme with a persisted toggle (`Ctrl+Alt+L`) and a light-aware palette across all widgets
 
 ## [1.2.0] - 2026-11-06
 

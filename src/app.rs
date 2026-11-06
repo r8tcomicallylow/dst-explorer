@@ -10,6 +10,7 @@ use eframe::egui::{
 };
 
 use crate::api::{self, FeedPage, SearchParams};
+use crate::audio::{self, AudioPlayer, PlaybackState};
 use crate::downloads::{DownloadManager, DownloadNotice, DownloadState};
 use crate::images::{ImageLoader, ImageSpec, Textures};
 use crate::i18n::{negotiate_best_language, I18n, Language};
@@ -19,8 +20,8 @@ use crate::models::{
 };
 use crate::store;
 use crate::theme::{
-    self, accent, accent_dim, Icon, ACCENTS, BG, BORDER, BORDER_SOFT, CARD, CARD_HOVER, DANGER,
-    DIM, MUTED, PANEL, SIDEBAR, SUCCESS, TEXT, WARNING,
+    self, accent, accent_dim, Icon, ACCENTS, BG, BORDER_SOFT, BORDER, CARD, CARD_HOVER, DANGER, DIM,
+    MUTED, PANEL, SIDEBAR, SUCCESS, TEXT, WARNING,
 };
 use crate::tray::{Tray, TrayAction};
 
@@ -161,6 +162,7 @@ enum DetailAction {
     Search { text: String, kind: SearchKind },
     Retry,
     Preview,
+    Play { folder: PathBuf, source: PathBuf },
     WatchMetaChanged,
 }
 
@@ -265,6 +267,7 @@ enum LibraryAction {
     Remove(u64),
     PlayInFoobar(PathBuf),
     SendToMpd(PathBuf),
+    PlayFolder { folder: PathBuf, source: PathBuf },
 }
 
 struct Toast {
@@ -331,6 +334,7 @@ pub struct App {
     textures: Textures,
     downloads: DownloadManager,
     dl_ui: DownloadUiState,
+    player: AudioPlayer,
     tray: Option<Tray>,
     tray_attempted: bool,
     tray_hint_shown: bool,
@@ -381,7 +385,11 @@ impl App {
         theme::install_fonts(&cc.egui_ctx);
         store::ensure_dirs();
         let persisted = store::load_state();
-        theme::configure(&cc.egui_ctx, persisted.settings.accent);
+        theme::configure(
+            &cc.egui_ctx,
+            persisted.settings.accent,
+            persisted.settings.light_theme,
+        );
         let settings = persisted.settings.clone();
         let (net_tx, net_rx) = unbounded();
         let first_run = persisted.last_seen_id == 0;
@@ -392,6 +400,7 @@ impl App {
             settings.auto_retry,
             settings.max_retries,
         );
+        let player = AudioPlayer::new(settings.audio_enabled, settings.audio_volume);
         let mut app = Self {
             persisted,
             view: View::Discover,
@@ -417,6 +426,7 @@ impl App {
                 cache_checked: Instant::now(),
                 manual_opened: HashSet::new(),
             },
+            player,
             tray: None,
             tray_attempted: false,
             tray_hint_shown: false,
@@ -1021,7 +1031,7 @@ impl App {
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
         let typing = ctx.wants_keyboard_input();
-        let (search_shortcut, refresh, escape, download, palette, shortcuts_help, nav_keys, fullscreen, pause_all, resume_all, cycle_theme) = ctx.input(|input| {
+        let (search_shortcut, refresh, escape, download, palette, shortcuts_help, nav_keys, fullscreen, pause_all, resume_all, cycle_theme, play_pause, next_track, prev_track, seek_forward, seek_back, volume_up, volume_down, toggle_light) = ctx.input(|input| {
             (
                 (input.modifiers.command && input.key_pressed(egui::Key::F))
                     || (!typing && input.key_pressed(egui::Key::Slash)),
@@ -1043,6 +1053,22 @@ impl App {
                 input.modifiers.alt && input.modifiers.command && input.key_pressed(egui::Key::P),
                 input.modifiers.alt && input.modifiers.command && input.key_pressed(egui::Key::R),
                 input.modifiers.alt && input.modifiers.command && input.key_pressed(egui::Key::T),
+                !typing && input.key_pressed(egui::Key::Space),
+                input.modifiers.command
+                    && !input.modifiers.shift
+                    && input.key_pressed(egui::Key::ArrowRight),
+                input.modifiers.command
+                    && !input.modifiers.shift
+                    && input.key_pressed(egui::Key::ArrowLeft),
+                input.modifiers.command
+                    && input.modifiers.shift
+                    && input.key_pressed(egui::Key::ArrowRight),
+                input.modifiers.command
+                    && input.modifiers.shift
+                    && input.key_pressed(egui::Key::ArrowLeft),
+                input.modifiers.command && input.key_pressed(egui::Key::ArrowUp),
+                input.modifiers.command && input.key_pressed(egui::Key::ArrowDown),
+                input.modifiers.alt && input.modifiers.command && input.key_pressed(egui::Key::L),
             )
         });
 
@@ -1114,6 +1140,45 @@ impl App {
                 format!("Theme accent: {}", ACCENTS[next].0),
                 ToastTone::Info,
             );
+        }
+        if toggle_light {
+            self.persisted.settings.light_theme = !self.persisted.settings.light_theme;
+            theme::configure(
+                ctx,
+                self.persisted.settings.accent,
+                self.persisted.settings.light_theme,
+            );
+            self.dirty = true;
+            self.toast(
+                if self.persisted.settings.light_theme {
+                    "Light theme enabled"
+                } else {
+                    "Dark theme enabled"
+                },
+                ToastTone::Info,
+            );
+        }
+        if play_pause {
+            self.player.toggle();
+        }
+        if next_track {
+            self.player.next();
+        }
+        if prev_track {
+            self.player.previous();
+        }
+        if seek_forward {
+            self.player.seek_relative(10.0);
+        }
+        if seek_back {
+            self.player.seek_relative(-10.0);
+        }
+        if volume_up || volume_down {
+            let delta = if volume_up { 0.05 } else { -0.05 };
+            let volume = (self.persisted.settings.audio_volume + delta).clamp(0.0, 1.0);
+            self.persisted.settings.audio_volume = volume;
+            self.player.set_volume(volume);
+            self.dirty = true;
         }
         if shortcuts_help {
             self.show_shortcuts = !self.show_shortcuts;
@@ -1569,6 +1634,7 @@ impl App {
                 DetailAction::Search { text, kind } => self.search_for(text, kind),
                 DetailAction::Retry => self.retry_detail(),
                 DetailAction::Preview => self.preview_cover = true,
+                DetailAction::Play { folder, source } => self.play_folder(&folder, &source),
                 DetailAction::WatchMetaChanged => self.dirty = true,
             }
         }
@@ -1718,6 +1784,12 @@ impl App {
             .iter()
             .any(|album| album.id == album_id);
         let in_library = self.persisted.in_library(album_id);
+        let playable = self
+            .persisted
+            .library
+            .iter()
+            .find(|entry| entry.album.id == album_id)
+            .map(|entry| (entry.folder(), entry.path.clone()));
         let persisted = &mut self.persisted;
         let watch_meta = if watched {
             Some(persisted.watch_meta.entry(album_id).or_default())
@@ -1733,7 +1805,7 @@ impl App {
                 .resizable(true)
                 .default_width(default_width)
                 .width_range(280.0..=520.0)
-                .frame(Frame::none().fill(PANEL).inner_margin(Margin {
+                .frame(Frame::none().fill(PANEL()).inner_margin(Margin {
                     left: detail_margin,
                     right: detail_margin,
                     top: if compact { 14.0 } else { 18.0 },
@@ -1748,6 +1820,7 @@ impl App {
                         in_library,
                         folders,
                         watch_meta,
+                        playable,
                         &mut requests,
                     );
                 });
@@ -1770,8 +1843,8 @@ impl App {
             .exact_height(if narrow { 96.0 } else { 66.0 })
             .frame(
                 Frame::none()
-                    .fill(PANEL)
-                    .stroke(Stroke::new(1.0_f32, BORDER_SOFT))
+                    .fill(PANEL())
+                    .stroke(Stroke::new(1.0_f32, BORDER_SOFT()))
                     .inner_margin(Margin {
                         left: pad,
                         right: pad,
@@ -1796,13 +1869,13 @@ impl App {
                             egui::RichText::new(&count_label)
                                 .size(12.5)
                                 .strong()
-                                .color(TEXT),
+                                .color(TEXT()),
                         );
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             if ui
                                 .add(
                                     egui::Button::new(
-                                        egui::RichText::new("Clear").size(12.0).color(MUTED),
+                                        egui::RichText::new("Clear").size(12.0).color(MUTED()),
                                     )
                                     .frame(false),
                                 )
@@ -1819,7 +1892,7 @@ impl App {
                                 egui::Button::new(
                                     egui::RichText::new("Select all loaded")
                                         .size(12.0)
-                                        .color(DIM),
+                                        .color(DIM()),
                                 )
                                 .frame(false),
                             )
@@ -1845,7 +1918,7 @@ impl App {
                             egui::RichText::new(&count_label)
                                 .size(13.5)
                                 .strong()
-                                .color(TEXT),
+                                .color(TEXT()),
                         );
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             if theme::primary_button(ui, &format!("Download {count}")).clicked() {
@@ -1854,7 +1927,7 @@ impl App {
                             if ui
                                 .add(
                                     egui::Button::new(
-                                        egui::RichText::new("Clear").size(12.5).color(MUTED),
+                                        egui::RichText::new("Clear").size(12.5).color(MUTED()),
                                     )
                                     .frame(false),
                                 )
@@ -1867,7 +1940,7 @@ impl App {
                                     egui::Button::new(
                                         egui::RichText::new("Select all loaded")
                                             .size(12.0)
-                                            .color(DIM),
+                                            .color(DIM()),
                                     )
                                     .frame(false),
                                 )
@@ -1895,6 +1968,177 @@ impl App {
         }
     }
 
+    fn draw_player_bar(&mut self, ctx: &egui::Context) {
+        self.player.tick();
+        if !self.player.has_track() && self.player.error().is_none() {
+            return;
+        }
+        let mut stop = false;
+        egui::TopBottomPanel::bottom("player-bar")
+            .exact_height(84.0)
+            .frame(
+                Frame::none()
+                    .fill(PANEL())
+                    .stroke(Stroke::new(1.0_f32, BORDER_SOFT()))
+                    .inner_margin(Margin {
+                        left: 18.0,
+                        right: 18.0,
+                        top: 8.0,
+                        bottom: 8.0,
+                    }),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.allocate_ui_with_layout(
+                        vec2(200.0, 64.0),
+                        Layout::top_down(Align::LEFT),
+                        |ui| {
+                            ui.add_space(6.0);
+                            let title = self
+                                .player
+                                .track_title()
+                                .map(|title| title.to_string())
+                                .unwrap_or_else(|| "Audio".to_string());
+                            ui.label(
+                                egui::RichText::new(elide_text(ui.painter(), &title, 12.5, 192.0))
+                                    .size(12.5)
+                                    .strong()
+                                    .color(TEXT()),
+                            );
+                            if let Some(error) = self.player.error() {
+                                ui.label(
+                                    egui::RichText::new(elide_text(
+                                        ui.painter(),
+                                        error,
+                                        10.0,
+                                        192.0,
+                                    ))
+                                    .size(10.0)
+                                    .color(DANGER()),
+                                );
+                            } else {
+                                let index = self.player.queue_index().unwrap_or(0) + 1;
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "Track {index}/{}",
+                                        self.player.queue_len()
+                                    ))
+                                    .size(10.0)
+                                    .color(DIM()),
+                                );
+                            }
+                        },
+                    );
+                    ui.add_space(4.0);
+                    if theme::icon_button(ui, Icon::Previous, 32.0, MUTED()).clicked() {
+                        self.player.previous();
+                    }
+                    let icon = if self.player.state() == PlaybackState::Playing {
+                        Icon::Pause
+                    } else {
+                        Icon::Play
+                    };
+                    if theme::icon_button(ui, icon, 40.0, accent()).clicked() {
+                        self.player.toggle();
+                    }
+                    if theme::icon_button(ui, Icon::Next, 32.0, MUTED()).clicked() {
+                        self.player.next();
+                    }
+                    ui.add_space(8.0);
+
+                    let time_width = 96.0;
+                    let wave_width = (ui.available_width() - time_width - 118.0).max(60.0);
+                    let wave_height = 44.0;
+                    let (rect, response) =
+                        ui.allocate_exact_size(vec2(wave_width, wave_height), Sense::click_and_drag());
+                    let peaks = self
+                        .player
+                        .waveform()
+                        .map(|waveform| waveform.peaks.clone())
+                        .unwrap_or_default();
+                    let progress = self.player.progress();
+                    paint_waveform(ui.painter(), rect, &peaks, progress);
+                    if response.clicked() || response.dragged() {
+                        if let Some(position) = response.interact_pointer_pos() {
+                            let fraction =
+                                ((position.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+                            self.player.set_position_fraction(fraction);
+                        }
+                    }
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} / {}",
+                            track_time(self.player.position()),
+                            track_time(self.player.duration())
+                        ))
+                        .size(10.0)
+                        .color(DIM()),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if theme::icon_button(ui, Icon::Close, 28.0, MUTED())
+                            .on_hover_text("Stop")
+                            .clicked()
+                        {
+                            stop = true;
+                        }
+                        if ui
+                            .add_sized(
+                                [84.0, 18.0],
+                                egui::Slider::new(
+                                    &mut self.persisted.settings.audio_volume,
+                                    0.0..=1.0,
+                                )
+                                .show_value(false),
+                            )
+                            .changed()
+                        {
+                            self.player
+                                .set_volume(self.persisted.settings.audio_volume);
+                            self.dirty = true;
+                        }
+                        theme::paint_icon(
+                            ui.painter(),
+                            Rect::from_center_size(
+                                pos2(ui.cursor().left() + 8.0, ui.cursor().center().y),
+                                vec2(14.0, 14.0),
+                            ),
+                            Icon::Volume,
+                            DIM(),
+                            1.3,
+                        );
+                        ui.add_space(18.0);
+                    });
+                });
+            });
+        if stop {
+            self.player.stop();
+        }
+        if self.player.is_playing() {
+            ctx.request_repaint_after(Duration::from_millis(200));
+        }
+    }
+
+    /// Start playback for a library folder, reporting a toast on failure.
+    fn play_folder(&mut self, folder: &Path, source: &Path) {
+        if folder.is_dir() {
+            match self.player.play_folder(folder) {
+                Ok(count) => self.toast(
+                    format!("Playing {count} track{}", if count == 1 { "" } else { "s" }),
+                    ToastTone::Info,
+                ),
+                Err(error) => self.toast(error, ToastTone::Error),
+            }
+        } else if source.is_file() && audio::is_audio_file(source) {
+            match self.player.play_file(source) {
+                Ok(()) => self.toast("Playing preview", ToastTone::Info),
+                Err(error) => self.toast(error, ToastTone::Error),
+            }
+        } else {
+            self.toast("That folder no longer exists.", ToastTone::Error);
+        }
+    }
+
     fn draw_central(&mut self, ctx: &egui::Context) {
         let compact = ctx.screen_rect().width() < 960.0;
         let (pad_left, pad_right, pad_top, pad_bottom) = if compact {
@@ -1903,7 +2147,7 @@ impl App {
             (28.0, 24.0, 20.0, 18.0)
         };
         egui::CentralPanel::default()
-            .frame(Frame::none().fill(BG).inner_margin(Margin {
+            .frame(Frame::none().fill(BG()).inner_margin(Margin {
                 left: pad_left,
                 right: pad_right,
                 top: pad_top,
@@ -1927,7 +2171,7 @@ impl App {
             self.t("discover-title"),
             self.t("discover-desc"),
             |ui| {
-                if theme::icon_button(ui, Icon::Refresh, 36.0, MUTED)
+                if theme::icon_button(ui, Icon::Refresh, 36.0, MUTED())
                     .on_hover_text(self.t("refresh-hover"))
                     .clicked()
                 {
@@ -1937,7 +2181,7 @@ impl App {
                     ui.label(
                         egui::RichText::new(format!("{} {}", loaded, self.t("loaded")))
                             .size(11.0)
-                            .color(DIM),
+                            .color(DIM()),
                     );
                 }
             },
@@ -2054,8 +2298,8 @@ impl App {
     fn view_search(&mut self, ui: &mut Ui) {
         let mut run_search = false;
         Frame::none()
-            .fill(PANEL)
-            .stroke(Stroke::new(1.0_f32, BORDER_SOFT))
+            .fill(PANEL())
+            .stroke(Stroke::new(1.0_f32, BORDER_SOFT()))
             .rounding(Rounding::same(14.0))
             .inner_margin(Margin::same(16.0))
             .show(ui, |ui| {
@@ -2096,7 +2340,7 @@ impl App {
                         egui::RichText::new("SEARCH BY")
                             .size(9.5)
                             .strong()
-                            .color(DIM),
+                            .color(DIM()),
                     );
                     ui.add_space(2.0);
                     for kind in SearchKind::ALL {
@@ -2105,7 +2349,7 @@ impl App {
                         }
                     }
                     ui.add_space(18.0);
-                    ui.label(egui::RichText::new("FORMAT").size(9.5).strong().color(DIM));
+                    ui.label(egui::RichText::new("FORMAT").size(9.5).strong().color(DIM()));
                     ui.add_space(2.0);
                     let options = [
                         ("FLAC", self.search.formats.flac),
@@ -2148,14 +2392,14 @@ impl App {
 
         if !history.is_empty() || !saved.is_empty() || !query.is_empty() {
             Frame::none()
-                .fill(CARD)
-                .stroke(Stroke::new(1.0_f32, BORDER_SOFT))
+                .fill(CARD())
+                .stroke(Stroke::new(1.0_f32, BORDER_SOFT()))
                 .rounding(Rounding::same(11.0))
                 .inner_margin(Margin::symmetric(12.0, 9.0))
                 .show(ui, |ui| {
                     if !history.is_empty() {
                         ui.horizontal_wrapped(|ui| {
-                            ui.label(egui::RichText::new("RECENT").size(9.5).strong().color(DIM));
+                            ui.label(egui::RichText::new("RECENT").size(9.5).strong().color(DIM()));
                             ui.add_space(2.0);
                             for entry in &history {
                                 let response = theme::chip(ui, &ellipsize(&entry.text, 28), false);
@@ -2171,7 +2415,7 @@ impl App {
                                         Some((entry.text.clone(), entry.kind, entry.formats));
                                 }
                             }
-                            if theme::small_button(ui, "Clear", DIM).clicked() {
+                            if theme::small_button(ui, "Clear", DIM()).clicked() {
                                 clear_history = true;
                             }
                         });
@@ -2181,7 +2425,7 @@ impl App {
                             ui.add_space(6.0);
                         }
                         ui.horizontal_wrapped(|ui| {
-                            ui.label(egui::RichText::new("SAVED").size(9.5).strong().color(DIM));
+                            ui.label(egui::RichText::new("SAVED").size(9.5).strong().color(DIM()));
                             ui.add_space(2.0);
                             for entry in &saved {
                                 ui.horizontal(|ui| {
@@ -2199,7 +2443,7 @@ impl App {
                                         apply_search =
                                             Some((entry.text.clone(), entry.kind, entry.formats));
                                     }
-                                    if theme::icon_button(ui, Icon::Close, 20.0, DIM)
+                                    if theme::icon_button(ui, Icon::Close, 20.0, DIM())
                                         .on_hover_text("Delete saved search")
                                         .clicked()
                                     {
@@ -2213,7 +2457,7 @@ impl App {
                         if !history.is_empty() || !saved.is_empty() {
                             ui.add_space(6.0);
                         }
-                        if theme::small_button(ui, "Save this search", MUTED).clicked() {
+                        if theme::small_button(ui, "Save this search", MUTED()).clicked() {
                             open_save = true;
                         }
                     }
@@ -2238,13 +2482,13 @@ impl App {
 
         if let Some(draft) = self.search_save_draft.as_mut() {
             Frame::none()
-                .fill(PANEL)
+                .fill(PANEL())
                 .stroke(Stroke::new(1.0_f32, accent_dim(70)))
                 .rounding(Rounding::same(11.0))
                 .inner_margin(Margin::symmetric(12.0, 9.0))
                 .show(ui, |ui| {
                     ui.horizontal_wrapped(|ui| {
-                        ui.label(egui::RichText::new("SAVE AS").size(9.5).strong().color(DIM));
+                        ui.label(egui::RichText::new("SAVE AS").size(9.5).strong().color(DIM()));
                         let width = (ui.available_width() - 150.0).clamp(100.0, 360.0);
                         let response = ui.add_sized(
                             [width, 30.0],
@@ -2260,7 +2504,7 @@ impl App {
                         if theme::primary_button_w(ui, "Save", 64.0).clicked() {
                             commit_save = true;
                         }
-                        if theme::icon_button(ui, Icon::Close, 22.0, DIM)
+                        if theme::icon_button(ui, Icon::Close, 22.0, DIM())
                             .on_hover_text("Cancel")
                             .clicked()
                         {
@@ -2295,7 +2539,7 @@ impl App {
         if self.search.searched {
             ui.add_space(2.0);
             ui.horizontal_wrapped(|ui| {
-                ui.label(egui::RichText::new("SORT").size(9.5).strong().color(DIM));
+                ui.label(egui::RichText::new("SORT").size(9.5).strong().color(DIM()));
                 ui.add_space(2.0);
                 for sort in SearchSort::ALL {
                     if theme::chip(
@@ -2317,7 +2561,7 @@ impl App {
         if self.search.searched {
             let mut filters_changed = false;
             ui.horizontal_wrapped(|ui| {
-                ui.label(egui::RichText::new("FILTER").size(9.5).strong().color(DIM));
+                ui.label(egui::RichText::new("FILTER").size(9.5).strong().color(DIM()));
                 ui.add_space(2.0);
                 if theme::chip(ui, "Regex", self.search_regex).clicked() {
                     self.search_regex = !self.search_regex;
@@ -2376,7 +2620,7 @@ impl App {
                     ui.label(
                         egui::RichText::new("invalid pattern")
                             .size(10.0)
-                            .color(DANGER),
+                            .color(DANGER()),
                     );
                 }
             });
@@ -2399,7 +2643,7 @@ impl App {
                     format!("Results for “{}”", self.search.query.trim())
                 };
                 ui.add(
-                    egui::Label::new(egui::RichText::new(title).size(14.0).strong().color(TEXT))
+                    egui::Label::new(egui::RichText::new(title).size(14.0).strong().color(TEXT()))
                         .truncate(),
                 );
                 ui.label(
@@ -2409,21 +2653,21 @@ impl App {
                         self.search.formats.summary()
                     ))
                     .size(11.0)
-                    .color(DIM),
+                    .color(DIM()),
                 );
             } else {
                 ui.label(
                     egui::RichText::new("Search the archive")
                         .size(15.0)
                         .strong()
-                        .color(TEXT),
+                        .color(TEXT()),
                 );
                 ui.label(
                     egui::RichText::new(
                         "Try a title, an artist, a tag like “Rock”, or the person who provided it.",
                     )
                     .size(11.5)
-                    .color(MUTED),
+                    .color(MUTED()),
                 );
             }
         });
@@ -2583,7 +2827,7 @@ impl App {
 
         let folders = self.persisted.watch_folders.clone();
         ui.horizontal_wrapped(|ui| {
-            ui.label(egui::RichText::new("FOLDERS").size(9.5).strong().color(DIM));
+            ui.label(egui::RichText::new("FOLDERS").size(9.5).strong().color(DIM()));
             if theme::chip(ui, "All", self.watch_filter == WatchFilter::All).clicked() {
                 self.set_watch_filter(WatchFilter::All);
             }
@@ -2606,10 +2850,10 @@ impl App {
 
         if let WatchFilter::Folder(name) = self.watch_filter.clone() {
             ui.horizontal_wrapped(|ui| {
-                if theme::small_button(ui, "Rename folder", MUTED).clicked() {
+                if theme::small_button(ui, "Rename folder", MUTED()).clicked() {
                     self.folder_rename = Some((name.clone(), name.clone()));
                 }
-                if theme::small_button(ui, "Delete folder", DANGER).clicked() {
+                if theme::small_button(ui, "Delete folder", DANGER()).clicked() {
                     self.persisted.remove_watch_folder(&name);
                     self.set_watch_filter(WatchFilter::All);
                     self.folder_rename = None;
@@ -2628,8 +2872,8 @@ impl App {
             {
                 let draft = self.folder_draft.as_mut().expect("checked");
                 Frame::none()
-                    .fill(PANEL)
-                    .stroke(Stroke::new(1.0_f32, BORDER_SOFT))
+                    .fill(PANEL())
+                    .stroke(Stroke::new(1.0_f32, BORDER_SOFT()))
                     .rounding(Rounding::same(9.0))
                     .inner_margin(Margin::symmetric(10.0, 8.0))
                     .show(ui, |ui| {
@@ -2638,7 +2882,7 @@ impl App {
                                 egui::RichText::new("NEW FOLDER")
                                     .size(9.5)
                                     .strong()
-                                    .color(DIM),
+                                    .color(DIM()),
                             );
                             let field = ui.add_sized(
                                 [220.0, 26.0],
@@ -2655,7 +2899,7 @@ impl App {
                             if theme::primary_button(ui, "Create").clicked() {
                                 create = true;
                             }
-                            if theme::small_button(ui, "Cancel", MUTED).clicked() {
+                            if theme::small_button(ui, "Cancel", MUTED()).clicked() {
                                 cancel = true;
                             }
                         });
@@ -2683,8 +2927,8 @@ impl App {
             {
                 let (_, draft) = self.folder_rename.as_mut().expect("checked");
                 Frame::none()
-                    .fill(PANEL)
-                    .stroke(Stroke::new(1.0_f32, BORDER_SOFT))
+                    .fill(PANEL())
+                    .stroke(Stroke::new(1.0_f32, BORDER_SOFT()))
                     .rounding(Rounding::same(9.0))
                     .inner_margin(Margin::symmetric(10.0, 8.0))
                     .show(ui, |ui| {
@@ -2693,7 +2937,7 @@ impl App {
                                 egui::RichText::new(format!("RENAME “{old}”"))
                                     .size(9.5)
                                     .strong()
-                                    .color(DIM),
+                                    .color(DIM()),
                             );
                             let field = ui.add_sized(
                                 [220.0, 26.0],
@@ -2709,7 +2953,7 @@ impl App {
                             if theme::primary_button(ui, "Save").clicked() {
                                 save = true;
                             }
-                            if theme::small_button(ui, "Cancel", MUTED).clicked() {
+                            if theme::small_button(ui, "Cancel", MUTED()).clicked() {
                                 cancel = true;
                             }
                         });
@@ -2821,8 +3065,8 @@ impl App {
                 .count();
             let average = if count > 0 { total / count as u64 } else { 0 };
             Frame::none()
-                .fill(PANEL)
-                .stroke(Stroke::new(1.0_f32, BORDER_SOFT))
+                .fill(PANEL())
+                .stroke(Stroke::new(1.0_f32, BORDER_SOFT()))
                 .rounding(Rounding::same(11.0))
                 .inner_margin(Margin::symmetric(14.0, 10.0))
                 .show(ui, |ui| {
@@ -2830,16 +3074,16 @@ impl App {
                         let stat = |ui: &mut Ui, label: &str, value: String, color: Color32| {
                             ui.vertical(|ui| {
                                 ui.label(egui::RichText::new(value).size(15.0).strong().color(color));
-                                ui.label(egui::RichText::new(label).size(9.5).color(DIM));
+                                ui.label(egui::RichText::new(label).size(9.5).color(DIM()));
                             });
                             ui.add_space(18.0);
                         };
-                        stat(ui, "ALBUMS", format_number(count), TEXT);
-                        stat(ui, "TOTAL SIZE", store::human_size(total), TEXT);
-                        stat(ui, "AVERAGE", store::human_size(average), TEXT);
-                        stat(ui, "LOSSLESS", format_number(lossless), SUCCESS);
-                        stat(ui, "LOSSY", format_number(lossy), MUTED);
-                        stat(ui, "MISSING", format_number(missing), if missing > 0 { DANGER } else { DIM });
+                        stat(ui, "ALBUMS", format_number(count), TEXT());
+                        stat(ui, "TOTAL SIZE", store::human_size(total), TEXT());
+                        stat(ui, "AVERAGE", store::human_size(average), TEXT());
+                        stat(ui, "LOSSLESS", format_number(lossless), SUCCESS());
+                        stat(ui, "LOSSY", format_number(lossy), MUTED());
+                        stat(ui, "MISSING", format_number(missing), if missing > 0 { DANGER() } else { DIM() });
                     });
                 });
             ui.add_space(8.0);
@@ -2898,7 +3142,7 @@ impl App {
             
             // Search box
             let (rect, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
-            theme::paint_icon(ui.painter(), rect, Icon::Search, DIM, 1.4);
+            theme::paint_icon(ui.painter(), rect, Icon::Search, DIM(), 1.4);
             let width = (ui.available_width() - 36.0).max(60.0);
             ui.add_sized(
                 [width, 24.0],
@@ -2909,7 +3153,7 @@ impl App {
                     .font(FontId::proportional(13.0)),
             );
             if !self.library_query.is_empty()
-                && theme::small_button(ui, "Clear", DIM).clicked()
+                && theme::small_button(ui, "Clear", DIM()).clicked()
             {
                 self.library_query.clear();
             }
@@ -2919,7 +3163,7 @@ impl App {
                 let has_filters = self.library_format_filter.is_some() 
                     || self.library_year_filter.is_some() 
                     || !self.library_query.is_empty();
-                if has_filters && theme::small_button(ui, "Clear all", DIM).clicked() {
+                if has_filters && theme::small_button(ui, "Clear all", DIM()).clicked() {
                     self.library_format_filter = None;
                     self.library_year_filter = None;
                     self.library_query.clear();
@@ -3021,8 +3265,8 @@ impl App {
                     let entry = &persisted.library[index];
                     let missing = entry.missing();
                     let response = Frame::none()
-                        .fill(CARD)
-                        .stroke(Stroke::new(1.0_f32, BORDER_SOFT))
+                        .fill(CARD())
+                        .stroke(Stroke::new(1.0_f32, BORDER_SOFT()))
                         .rounding(Rounding::same(11.0))
                         .inner_margin(Margin::same(10.0))
                         .show(ui, |ui| {
@@ -3055,7 +3299,7 @@ impl App {
                                 }
                                 ui.add_space(10.0);
 
-                                let buttons_width = 70.0;
+                                let buttons_width = 105.0;
                                 let text_width = (ui.available_width() - buttons_width).max(80.0);
                                 ui.allocate_ui_with_layout(
                                     vec2(text_width, 56.0),
@@ -3073,7 +3317,7 @@ impl App {
                                                     egui::RichText::new(title)
                                                         .size(13.0)
                                                         .strong()
-                                                        .color(if missing { MUTED } else { TEXT }),
+                                                        .color(if missing { MUTED() } else { TEXT() }),
                                                 )
                                                 .sense(Sense::click()),
                                             )
@@ -3094,7 +3338,7 @@ impl App {
                                                 text_width - 2.0,
                                             ))
                                             .size(11.0)
-                                            .color(MUTED),
+                                            .color(MUTED()),
                                         );
                                         ui.add_space(2.0);
                                         ui.horizontal_wrapped(|ui| {
@@ -3129,20 +3373,20 @@ impl App {
                                             ui.label(
                                                 egui::RichText::new(parts.join(" · "))
                                                     .size(10.0)
-                                                    .color(DIM),
+                                                    .color(DIM()),
                                             );
                                             if missing {
                                                 theme::badge(
                                                     ui,
                                                     "MISSING",
-                                                    DANGER,
+                                                    DANGER(),
                                                     Color32::from_rgb(38, 23, 29),
                                                 );
                                             } else if entry.warning.is_some() {
                                                 theme::badge(
                                                     ui,
-                                                    "WARNING",
-                                                    WARNING,
+                                                    "WARNING()",
+                                                    WARNING(),
                                                     Color32::from_rgb(38, 32, 20),
                                                 );
                                             }
@@ -3151,13 +3395,24 @@ impl App {
                                 );
 
                                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                    if theme::small_button(ui, "MPD", MUTED)
+                                    if theme::small_button(ui, "MPD", MUTED())
                                         .on_hover_text("Add this folder to the MPD queue")
                                         .clicked()
                                     {
                                         actions.push(LibraryAction::SendToMpd(entry.folder()));
                                     }
-                                    if theme::icon_button(ui, Icon::Trash, 30.0, MUTED)
+                                    if (entry.extracted.as_ref().map(|p| p.exists()).unwrap_or(false)
+                                        || entry.path.exists())
+                                        && theme::icon_button(ui, Icon::Play, 30.0, accent())
+                                            .on_hover_text("Play in DST-Explorer")
+                                            .clicked()
+                                    {
+                                        actions.push(LibraryAction::PlayFolder {
+                                            folder: entry.folder(),
+                                            source: entry.path.clone(),
+                                        });
+                                    }
+                                    if theme::icon_button(ui, Icon::Trash, 30.0, MUTED())
                                         .on_hover_text("Remove from library")
                                         .clicked()
                                     {
@@ -3165,12 +3420,12 @@ impl App {
                                     }
                                     if !entry.extracted.as_ref().map(|p| p.exists()).unwrap_or(false) && !entry.path.exists() {
                                         // Don't offer foobar if files don't exist
-                                    } else if theme::icon_button(ui, Icon::Folder, 30.0, MUTED)
+                                    } else if theme::icon_button(ui, Icon::Folder, 30.0, MUTED())
                                         .on_hover_text("Open folder")
                                         .clicked()
                                     {
                                         actions.push(LibraryAction::OpenFolder(entry.folder()));
-                                    } else if theme::icon_button(ui, Icon::External, 30.0, MUTED)
+                                    } else if theme::icon_button(ui, Icon::External, 30.0, MUTED())
                                         .on_hover_text("Play in foobar2000")
                                         .clicked()
                                     {
@@ -3215,6 +3470,9 @@ impl App {
                     );
                 }
                 LibraryAction::PlayInFoobar(path) => self.play_in_foobar2000(&path),
+                LibraryAction::PlayFolder { folder, source } => {
+                    self.play_folder(&folder, &source)
+                }
                 LibraryAction::SendToMpd(path) => {
                     let host = self.persisted.settings.mpd_host.trim().to_string();
                     if host.is_empty() {
@@ -3297,7 +3555,7 @@ impl App {
             let hosts = self.downloads.hosts();
             if !hosts.is_empty() {
                 ui.horizontal_wrapped(|ui| {
-                    ui.label(egui::RichText::new("HOSTS").size(9.5).strong().color(DIM));
+                    ui.label(egui::RichText::new("HOSTS").size(9.5).strong().color(DIM()));
                     ui.add_space(2.0);
                     for host in hosts {
                         let active = self
@@ -3331,7 +3589,7 @@ impl App {
         }
 
         ui.horizontal_wrapped(|ui| {
-            ui.label(egui::RichText::new("FILTER").size(9.5).strong().color(DIM));
+            ui.label(egui::RichText::new("FILTER").size(9.5).strong().color(DIM()));
             ui.add_space(2.0);
             for filter in DlFilter::ALL {
                 if theme::chip(ui, filter.label(), self.dl_filter == filter).clicked() {
@@ -3348,7 +3606,7 @@ impl App {
                     .hint_text("Filter queue by title, artist or host…")
                     .font(FontId::proportional(12.0)),
             );
-            if !self.dl_query.is_empty() && theme::small_button(ui, "Clear", DIM).clicked() {
+            if !self.dl_query.is_empty() && theme::small_button(ui, "Clear", DIM()).clicked() {
                 self.dl_query.clear();
             }
         });
@@ -3458,7 +3716,7 @@ impl App {
             egui::RichText::new(self.t("settings"))
                 .font(FontId::new(27.0, FontFamily::Proportional))
                 .strong()
-                .color(TEXT),
+                .color(TEXT()),
         );
         ui.add_space(12.0);
 
@@ -3470,13 +3728,13 @@ impl App {
                     ui.label(
                         egui::RichText::new(self.t("save-location"))
                             .size(12.0)
-                            .color(MUTED),
+                            .color(MUTED()),
                     );
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
                         Frame::none()
-                            .fill(BG)
-                            .stroke(Stroke::new(1.0_f32, BORDER_SOFT))
+                            .fill(BG())
+                            .stroke(Stroke::new(1.0_f32, BORDER_SOFT()))
                             .rounding(Rounding::same(8.0))
                             .inner_margin(Margin {
                                 left: 10.0,
@@ -3491,12 +3749,12 @@ impl App {
                                             self.persisted.settings.download_dir.display().to_string(),
                                         )
                                         .size(11.5)
-                                        .color(TEXT),
+                                        .color(TEXT()),
                                     )
                                     .truncate(),
                                 );
                             });
-                        if theme::small_button(ui, self.t("browse"), TEXT).clicked() {
+                        if theme::small_button(ui, self.t("browse"), TEXT()).clicked() {
                             if let Some(folder) = rfd::FileDialog::new()
                                 .set_title(self.t("choose-download-folder"))
                                 .set_directory(&self.persisted.settings.download_dir)
@@ -3506,7 +3764,7 @@ impl App {
                                 changed = true;
                             }
                         }
-                        if theme::small_button(ui, self.t("open"), TEXT).clicked() {
+                        if theme::small_button(ui, self.t("open"), TEXT()).clicked() {
                             let dir = self.persisted.settings.download_dir.clone();
                             let _ = std::fs::create_dir_all(&dir);
                             store::open_path(&dir);
@@ -3517,7 +3775,7 @@ impl App {
                         ui.label(
                             egui::RichText::new(self.t("simultaneous-downloads"))
                                 .size(12.0)
-                                .color(MUTED),
+                                .color(MUTED()),
                         );
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             ui.label(
@@ -3560,12 +3818,12 @@ impl App {
                         ui.label(
                             egui::RichText::new(self.t("foobar2000-path"))
                                 .size(12.0)
-                                .color(MUTED),
+                                .color(MUTED()),
                         );
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             Frame::none()
-                                .fill(BG)
-                                .stroke(Stroke::new(1.0_f32, BORDER_SOFT))
+                                .fill(BG())
+                                .stroke(Stroke::new(1.0_f32, BORDER_SOFT()))
                                 .rounding(Rounding::same(8.0))
                                 .inner_margin(Margin {
                                     left: 10.0,
@@ -3583,12 +3841,12 @@ impl App {
                                                     .unwrap_or_else(|| self.t("not-set").to_string()),
                                             )
                                             .size(11.5)
-                                            .color(TEXT),
+                                            .color(TEXT()),
                                         )
                                         .truncate(),
                                     );
                                 });
-                            if theme::small_button(ui, self.t("browse"), TEXT).clicked() {
+                            if theme::small_button(ui, self.t("browse"), TEXT()).clicked() {
                                 if let Some(path) = rfd::FileDialog::new()
                                     .set_title(self.t("select-foobar2000"))
                                     .add_filter("Executable", &["exe"])
@@ -3598,7 +3856,7 @@ impl App {
                                     changed = true;
                                 }
                             }
-                            if theme::small_button(ui, self.t("clear"), TEXT).clicked() {
+                            if theme::small_button(ui, self.t("clear"), TEXT()).clicked() {
                                 self.persisted.settings.foobar2000_path = None;
                                 changed = true;
                             }
@@ -3621,7 +3879,7 @@ impl App {
                         ui.label(
                             egui::RichText::new(self.t("max-retries"))
                                 .size(12.0)
-                                .color(MUTED),
+                                .color(MUTED()),
                         );
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             let attempts = self.t("attempts");
@@ -3652,14 +3910,14 @@ impl App {
                     ui.label(
                         egui::RichText::new(self.t("auto-save-rules-desc"))
                             .size(11.5)
-                            .color(MUTED),
+                            .color(MUTED()),
                     );
                     ui.add_space(10.0);
                     if self.persisted.save_rules.is_empty() && draft.is_none() {
                         ui.label(
                             egui::RichText::new(self.t("no-rules-yet"))
                                 .size(11.5)
-                                .color(DIM),
+                                .color(DIM()),
                         );
                         ui.add_space(8.0);
                     }
@@ -3667,8 +3925,8 @@ impl App {
                     let enable_rule_label = self.t("enable-rule");
                     for (index, rule) in self.persisted.save_rules.iter_mut().enumerate() {
                         Frame::none()
-                            .fill(BG)
-                            .stroke(Stroke::new(1.0_f32, BORDER_SOFT))
+                            .fill(BG())
+                            .stroke(Stroke::new(1.0_f32, BORDER_SOFT()))
                             .rounding(Rounding::same(8.0))
                             .inner_margin(Margin::symmetric(10.0, 8.0))
                             .show(ui, |ui| {
@@ -3685,7 +3943,7 @@ impl App {
                                             egui::RichText::new(&rule.query)
                                                 .size(12.0)
                                                 .strong()
-                                                .color(TEXT),
+                                                .color(TEXT()),
                                         );
                                         let mut details = rule.field.label().to_string();
                                         if let Some(folder) = &rule.folder {
@@ -3694,13 +3952,13 @@ impl App {
                                         ui.label(
                                             egui::RichText::new(details)
                                                 .size(10.5)
-                                                .color(DIM),
+                                                .color(DIM()),
                                         );
                                     });
                                     ui.with_layout(
                                         Layout::right_to_left(Align::Center),
                                         |ui| {
-                                            if theme::icon_button(ui, Icon::Trash, 24.0, DIM)
+                                            if theme::icon_button(ui, Icon::Trash, 24.0, DIM())
                                                 .on_hover_text(&delete_rule_label)
                                                 .clicked()
                                             {
@@ -3715,7 +3973,7 @@ impl App {
 
                     if let Some(draft) = draft.as_mut() {
                         Frame::none()
-                            .fill(BG)
+                            .fill(BG())
                             .stroke(Stroke::new(1.0_f32, accent_dim(70)))
                             .rounding(Rounding::same(9.0))
                             .inner_margin(Margin::symmetric(10.0, 9.0))
@@ -3724,7 +3982,7 @@ impl App {
                                     egui::RichText::new(self.t("match-text"))
                                         .size(9.5)
                                         .strong()
-                                        .color(DIM),
+                                        .color(DIM()),
                                 );
                                 ui.add_space(3.0);
                                 ui.add_sized(
@@ -3739,7 +3997,7 @@ impl App {
                                         egui::RichText::new(self.t("in-field"))
                                             .size(9.5)
                                             .strong()
-                                            .color(DIM),
+                                            .color(DIM()),
                                     );
                                     for field in RuleField::ALL {
                                         if theme::chip(
@@ -3759,7 +4017,7 @@ impl App {
                                         egui::RichText::new(self.t("folder-optional"))
                                             .size(9.5)
                                             .strong()
-                                            .color(DIM),
+                                            .color(DIM()),
                                     );
                                     ui.add_sized(
                                         [180.0, 28.0],
@@ -3770,12 +4028,12 @@ impl App {
                                     if theme::primary_button_w(ui, self.t("add-rule"), 82.0).clicked() {
                                         commit_rule = true;
                                     }
-                                    if theme::small_button(ui, self.t("cancel"), DIM).clicked() {
+                                    if theme::small_button(ui, self.t("cancel"), DIM()).clicked() {
                                         cancel_rule = true;
                                     }
                                 });
                             });
-                    } else if theme::small_button(ui, self.t("add-rule"), TEXT).clicked() {
+                    } else if theme::small_button(ui, self.t("add-rule"), TEXT()).clicked() {
                         add_rule = true;
                     }
                 });
@@ -3810,7 +4068,7 @@ impl App {
                         ui.label(
                             egui::RichText::new("Speed limit")
                                 .size(12.0)
-                                .color(MUTED),
+                                .color(MUTED()),
                         );
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             ui.label(
@@ -3857,7 +4115,7 @@ impl App {
                             ui.label(
                                 egui::RichText::new("Window")
                                     .size(11.5)
-                                    .color(MUTED),
+                                    .color(MUTED()),
                             );
                             ui.add(
                                 egui::DragValue::new(
@@ -3866,7 +4124,7 @@ impl App {
                                 .range(0..=23)
                                 .suffix(":00"),
                             );
-                            ui.label(egui::RichText::new("→").size(11.5).color(DIM));
+                            ui.label(egui::RichText::new("→").size(11.5).color(DIM()));
                             ui.add(
                                 egui::DragValue::new(
                                     &mut self.persisted.settings.schedule_end_hour,
@@ -3881,7 +4139,7 @@ impl App {
                                     "Waiting for the window"
                                 })
                                 .size(10.5)
-                                .color(DIM),
+                                .color(DIM()),
                             );
                         });
                     }
@@ -3892,7 +4150,7 @@ impl App {
                     ui.label(
                         egui::RichText::new(self.t("accent-color"))
                             .size(12.0)
-                            .color(MUTED),
+                            .color(MUTED()),
                     );
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
@@ -3919,18 +4177,37 @@ impl App {
                             }
                             if response.clicked() {
                                 self.persisted.settings.accent = index;
-                                theme::configure(ctx, index);
+                                theme::configure(
+                                    ctx,
+                                    index,
+                                    self.persisted.settings.light_theme,
+                                );
                                 changed = true;
                             }
                             response.on_hover_text(*name);
                         }
                     });
                     ui.add_space(16.0);
+                    if ui
+                        .checkbox(
+                            &mut self.persisted.settings.light_theme,
+                            egui::RichText::new("Light theme (Ctrl+Alt+L)").size(12.5),
+                        )
+                        .changed()
+                    {
+                        theme::configure(
+                            ctx,
+                            self.persisted.settings.accent,
+                            self.persisted.settings.light_theme,
+                        );
+                        changed = true;
+                    }
+                    ui.add_space(16.0);
                     ui.horizontal(|ui| {
                         ui.label(
                             egui::RichText::new(self.t("thumbnail-budget"))
                                 .size(12.0)
-                                .color(MUTED),
+                                .color(MUTED()),
                         );
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             ui.label(
@@ -3995,7 +4272,7 @@ impl App {
                         ui.label(
                             egui::RichText::new("UI scale")
                                 .size(12.0)
-                                .color(MUTED),
+                                .color(MUTED()),
                         );
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             ui.label(
@@ -4074,14 +4351,14 @@ impl App {
                         egui::RichText::new("RSS feeds")
                             .size(12.5)
                             .strong()
-                            .color(TEXT),
+                            .color(TEXT()),
                     );
                     ui.label(
                         egui::RichText::new(
                             "Paste RSS or Atom feed URLs. New entries are announced in the app.",
                         )
                         .size(10.5)
-                        .color(DIM),
+                        .color(DIM()),
                     );
                     ui.add_space(6.0);
                     let mut remove_feed: Option<String> = None;
@@ -4090,9 +4367,9 @@ impl App {
                             ui.label(
                                 egui::RichText::new(ellipsize(&feed, 52))
                                     .size(10.8)
-                                    .color(MUTED),
+                                    .color(MUTED()),
                             );
-                            if theme::icon_button(ui, Icon::Close, 20.0, DIM)
+                            if theme::icon_button(ui, Icon::Close, 20.0, DIM())
                                 .on_hover_text("Remove feed")
                                 .clicked()
                             {
@@ -4139,7 +4416,7 @@ impl App {
                                 }
                             ))
                             .size(10.0)
-                            .color(DIM),
+                            .color(DIM()),
                         );
                     });
                 });
@@ -4149,7 +4426,7 @@ impl App {
                     ui.label(
                         egui::RichText::new(self.t("interface-language"))
                             .size(12.0)
-                            .color(MUTED),
+                            .color(MUTED()),
                     );
                     ui.add_space(8.0);
                     ui.horizontal_wrapped(|ui| {
@@ -4174,7 +4451,7 @@ impl App {
                                 egui::RichText::new(self.t("image-cache"))
                                     .size(12.5)
                                     .strong()
-                                    .color(TEXT),
+                                    .color(TEXT()),
                             );
                             ui.label(
                                 egui::RichText::new(format!(
@@ -4183,7 +4460,7 @@ impl App {
                                     self.t("stored-on-disk")
                                 ))
                                 .size(11.5)
-                                .color(MUTED),
+                                .color(MUTED()),
                             );
                         });
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -4221,7 +4498,7 @@ impl App {
                         ui.label(
                             egui::RichText::new(format!("Last backup: {last}"))
                                 .size(10.5)
-                                .color(DIM),
+                                .color(DIM()),
                         );
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             if theme::secondary_button(ui, "Back up now").clicked() {
@@ -4240,7 +4517,7 @@ impl App {
                         ui.label(
                             egui::RichText::new("Library cleanup")
                                 .size(12.0)
-                                .color(MUTED),
+                                .color(MUTED()),
                         );
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             if theme::secondary_button(ui, "Open library").clicked() {
@@ -4264,11 +4541,68 @@ impl App {
                 });
 
                 ui.add_space(14.0);
+                settings_card(ui, "Playback", |ui| {
+                    if ui
+                        .checkbox(
+                            &mut self.persisted.settings.audio_enabled,
+                            egui::RichText::new("Built-in audio preview player").size(12.5),
+                        )
+                        .changed()
+                    {
+                        self.player
+                            .set_enabled(self.persisted.settings.audio_enabled);
+                        changed = true;
+                    }
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("Volume")
+                                .size(12.0)
+                                .color(MUTED()),
+                        );
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{:.0}%",
+                                    self.persisted.settings.audio_volume * 100.0
+                                ))
+                                .size(12.0)
+                                .strong()
+                                .color(accent()),
+                            );
+                            if ui
+                                .add_sized(
+                                    [190.0, 20.0],
+                                    egui::Slider::new(
+                                        &mut self.persisted.settings.audio_volume,
+                                        0.0..=1.0,
+                                    )
+                                    .show_value(false),
+                                )
+                                .changed()
+                            {
+                                self.player
+                                    .set_volume(self.persisted.settings.audio_volume);
+                                changed = true;
+                            }
+                        });
+                    });
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "Space: play/pause | Ctrl+Left/Right: previous/next | Ctrl+Shift+Left/Right: seek 10 s | Ctrl+Up/Down: volume",
+                        )
+                        .size(10.5)
+                        .color(DIM()),
+                    );
+                });
+
+                ui.add_space(14.0);
                 settings_card(ui, "Integrations", |ui| {
                     ui.label(
                         egui::RichText::new("MPD server")
                             .size(12.0)
-                            .color(MUTED),
+                            .color(MUTED()),
                     );
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
@@ -4311,7 +4645,7 @@ impl App {
                             "Use the MPD button in your library to add a folder to the player queue.",
                         )
                         .size(10.5)
-                        .color(DIM),
+                        .color(DIM()),
                     );
                 });
 
@@ -4329,7 +4663,7 @@ impl App {
                     ui.label(
                         egui::RichText::new(self.t("import-export-desc"))
                             .size(10.5)
-                            .color(DIM),
+                            .color(DIM()),
                     );
                 });
                 
@@ -4339,18 +4673,18 @@ impl App {
                         egui::RichText::new("DST-Explorer")
                             .size(15.0)
                             .strong()
-                            .color(TEXT),
+                            .color(TEXT()),
                     );
                     ui.label(
                         egui::RichText::new(format!("Version {} · {}", env!("CARGO_PKG_VERSION"), self.t("desktop-client")))
                             .size(11.5)
-                            .color(MUTED),
+                            .color(MUTED()),
                     );
                     ui.add_space(8.0);
                     ui.label(
                         egui::RichText::new(self.t("about-desc"))
                             .size(11.5)
-                            .color(MUTED),
+                            .color(MUTED()),
                     );
                     ui.add_space(10.0);
                     ui.horizontal(|ui| {
@@ -4449,8 +4783,8 @@ impl App {
                 for (text, tone, action, fade) in toasts.into_iter().rev() {
                     let (dot, frame_stroke) = match tone {
                         ToastTone::Info => (accent(), accent_dim(55)),
-                        ToastTone::Success => (SUCCESS, Color32::from_rgb(35, 67, 52)),
-                        ToastTone::Error => (DANGER, Color32::from_rgb(76, 36, 44)),
+                        ToastTone::Success => (SUCCESS(), Color32::from_rgb(35, 67, 52)),
+                        ToastTone::Error => (DANGER(), Color32::from_rgb(76, 36, 44)),
                     };
                     ui.set_opacity(fade);
                     Frame::none()
@@ -4475,7 +4809,7 @@ impl App {
                                     ui.allocate_exact_size(vec2(9.0, 9.0), Sense::hover());
                                 ui.painter().circle_filled(rect.center(), 4.0, dot);
                                 ui.add_space(2.0);
-                                ui.label(egui::RichText::new(text).size(12.0).color(TEXT));
+                                ui.label(egui::RichText::new(text).size(12.0).color(TEXT()));
                                 if let Some(action) = action {
                                     if theme::small_button(ui, "Open", accent()).clicked() {
                                         pending = Some(action);
@@ -4516,7 +4850,7 @@ impl App {
                     egui::RichText::new(format!("Download {count} albums?"))
                         .size(15.0)
                         .strong()
-                        .color(TEXT),
+                        .color(TEXT()),
                 );
                 ui.add_space(6.0);
                 ui.label(
@@ -4524,21 +4858,21 @@ impl App {
                         "They will all be added to the download queue. Large batches can take a long time and a lot of disk space.",
                     )
                     .size(11.5)
-                    .color(MUTED),
+                    .color(MUTED()),
                 );
                 ui.add_space(10.0);
                 for album in albums.iter().take(6) {
                     ui.label(
                         egui::RichText::new(format!("• {}", album.title))
                             .size(11.0)
-                            .color(DIM),
+                            .color(DIM()),
                     );
                 }
                 if count > 6 {
                     ui.label(
                         egui::RichText::new(format!("…and {} more", count - 6))
                             .size(11.0)
-                            .color(DIM),
+                            .color(DIM()),
                     );
                 }
                 ui.add_space(14.0);
@@ -4546,7 +4880,7 @@ impl App {
                     if theme::primary_button(ui, &format!("Download {count}")).clicked() {
                         confirm = true;
                     }
-                    if theme::small_button(ui, "Cancel", MUTED).clicked() {
+                    if theme::small_button(ui, "Cancel", MUTED()).clicked() {
                         cancel = true;
                     }
                 });
@@ -4590,12 +4924,12 @@ impl App {
                             egui::RichText::new(&album.title)
                                 .size(13.0)
                                 .strong()
-                                .color(TEXT),
+                                .color(TEXT()),
                         )
                         .truncate(),
                     );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if theme::icon_button(ui, Icon::Close, 28.0, MUTED).clicked() {
+                        if theme::icon_button(ui, Icon::Close, 28.0, MUTED()).clicked() {
                             close = true;
                         }
                     });
@@ -4614,7 +4948,7 @@ impl App {
                     ui.label(
                         egui::RichText::new("Loading cover…")
                             .size(11.0)
-                            .color(MUTED),
+                            .color(MUTED()),
                     );
                 }
             });
@@ -4645,8 +4979,8 @@ impl App {
             .anchor(Align2::CENTER_CENTER, [0.0, -screen.height() * 0.08])
             .frame(
                 Frame::none()
-                    .fill(PANEL)
-                    .stroke(Stroke::new(1.0_f32, BORDER))
+                    .fill(PANEL())
+                    .stroke(Stroke::new(1.0_f32, BORDER()))
                     .rounding(Rounding::same(12.0))
                     .inner_margin(Margin::same(16.0)),
             )
@@ -4655,7 +4989,7 @@ impl App {
                     egui::RichText::new("Command palette")
                         .size(12.0)
                         .strong()
-                        .color(DIM),
+                        .color(DIM()),
                 );
                 ui.add_space(8.0);
 
@@ -4710,9 +5044,9 @@ impl App {
                             let bg = if selected {
                                 Color32::from_rgba_unmultiplied(accent().r(), accent().g(), accent().b(), 20)
                             } else if response.hovered() || ui.rect_contains_pointer(ui.min_rect()) {
-                                CARD_HOVER
+                                CARD_HOVER()
                             } else {
-                                CARD
+                                CARD()
                             };
                             let (rect, item_response) =
                                 ui.allocate_exact_size(vec2(panel_width - 32.0, 44.0), Sense::click());
@@ -4723,14 +5057,14 @@ impl App {
                                 Align2::LEFT_CENTER,
                                 title,
                                 FontId::proportional(13.5),
-                                TEXT,
+                                TEXT(),
                             );
                             ui.painter().text(
                                 pos2(rect.left() + 16.0, rect.center().y + 6.0),
                                 Align2::LEFT_CENTER,
                                 subtitle,
                                 FontId::proportional(10.5),
-                                MUTED,
+                                MUTED(),
                             );
 
                             if item_response.clicked() {
@@ -4745,7 +5079,7 @@ impl App {
                                     ui.label(
                                         egui::RichText::new("No matching commands")
                                             .size(12.0)
-                                            .color(DIM),
+                                            .color(DIM()),
                                     );
                                 },
                             );
@@ -4756,7 +5090,7 @@ impl App {
                 ui.label(
                     egui::RichText::new("Arrow keys to navigate · Enter to open · Esc to close")
                         .size(10.0)
-                        .color(DIM),
+                        .color(DIM()),
                 );
 
                 if let Some(index) = run_action {
@@ -4832,8 +5166,8 @@ impl App {
             .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
             .frame(
                 Frame::none()
-                    .fill(PANEL)
-                    .stroke(Stroke::new(1.0_f32, BORDER))
+                    .fill(PANEL())
+                    .stroke(Stroke::new(1.0_f32, BORDER()))
                     .rounding(Rounding::same(12.0))
                     .inner_margin(Margin::same(20.0)),
             )
@@ -4850,7 +5184,7 @@ impl App {
                     egui::RichText::new("Global")
                         .size(10.5)
                         .strong()
-                        .color(DIM),
+                        .color(DIM()),
                 );
                 ui.add_space(4.0);
                 shortcut_row(ui, "Ctrl+P", "Command palette");
@@ -4865,7 +5199,7 @@ impl App {
                     egui::RichText::new("Navigation")
                         .size(10.5)
                         .strong()
-                        .color(DIM),
+                        .color(DIM()),
                 );
                 ui.add_space(4.0);
                 shortcut_row(ui, "1", "Discover / latest releases");
@@ -4880,7 +5214,7 @@ impl App {
                     egui::RichText::new("Selection (grid views)")
                         .size(10.5)
                         .strong()
-                        .color(DIM),
+                        .color(DIM()),
                 );
                 ui.add_space(4.0);
                 shortcut_row(ui, "Click", "Toggle album selection");
@@ -4892,11 +5226,26 @@ impl App {
                     egui::RichText::new("Detail panel")
                         .size(10.5)
                         .strong()
-                        .color(DIM),
+                        .color(DIM()),
                 );
                 ui.add_space(4.0);
                 shortcut_row(ui, "Enter", "Download album from detail panel");
                 shortcut_row(ui, "Esc", "Close detail panel");
+                ui.add_space(14.0);
+
+                ui.label(
+                    egui::RichText::new("Playback & theme")
+                        .size(10.5)
+                        .strong()
+                        .color(DIM()),
+                );
+                ui.add_space(4.0);
+                shortcut_row(ui, "Space", "Play / pause the built-in player");
+                shortcut_row(ui, "Ctrl+Left / Ctrl+Right", "Previous / next track");
+                shortcut_row(ui, "Ctrl+Shift+Left / Right", "Seek 10 seconds");
+                shortcut_row(ui, "Ctrl+Up / Ctrl+Down", "Player volume");
+                shortcut_row(ui, "Ctrl+Alt+L", "Toggle light / dark theme");
+                shortcut_row(ui, "Ctrl+Alt+T", "Cycle accent colour");
 
                 ui.add_space(16.0);
                 ui.horizontal(|ui| {
@@ -4995,6 +5344,7 @@ impl eframe::App for App {
 
         self.draw_sidebar(ctx);
         self.draw_detail_panel(ctx);
+        self.draw_player_bar(ctx);
         self.draw_selection_bar(ctx);
         self.draw_central(ctx);
         self.draw_confirm_bulk(ctx);
@@ -5223,8 +5573,8 @@ fn format_relative_time(timestamp: u64) -> String {
 
 fn draw_search_field(ui: &mut Ui, query: &mut String, width: f32) -> Response {
     Frame::none()
-        .fill(BG)
-        .stroke(Stroke::new(1.0_f32, BORDER))
+        .fill(BG())
+        .stroke(Stroke::new(1.0_f32, BORDER()))
         .rounding(Rounding::same(9.0))
         .inner_margin(Margin {
             left: 11.0,
@@ -5235,7 +5585,7 @@ fn draw_search_field(ui: &mut Ui, query: &mut String, width: f32) -> Response {
         .show(ui, |ui| {
             ui.horizontal_centered(|ui| {
                 let (rect, _) = ui.allocate_exact_size(vec2(17.0, 17.0), Sense::hover());
-                theme::paint_icon(ui.painter(), rect, Icon::Search, DIM, 1.5);
+                theme::paint_icon(ui.painter(), rect, Icon::Search, DIM(), 1.5);
                 let response = ui.add_sized(
                     [width, 26.0],
                     TextEdit::singleline(query)
@@ -5288,12 +5638,12 @@ fn view_heading(ui: &mut Ui, eyebrow: &str, title: &str, subtitle: &str) {
                     egui::RichText::new(title)
                         .font(FontId::new(27.0, FontFamily::Proportional))
                         .strong()
-                        .color(TEXT),
+                        .color(TEXT()),
                 )
                 .wrap(),
             );
         if !subtitle.is_empty() {
-            ui.label(egui::RichText::new(subtitle).size(12.0).color(MUTED));
+            ui.label(egui::RichText::new(subtitle).size(12.0).color(MUTED()));
         }
     });
 }
@@ -5307,7 +5657,7 @@ fn draw_loading(ui: &mut Ui, text: &str) {
             ui.add_space((height * 0.24).min(150.0));
             ui.add(egui::Spinner::new().size(24.0).color(accent()));
             ui.add_space(12.0);
-            ui.label(egui::RichText::new(text).size(12.5).color(MUTED));
+            ui.label(egui::RichText::new(text).size(12.5).color(MUTED()));
         },
     );
 }
@@ -5342,14 +5692,14 @@ fn draw_empty(
                     egui::RichText::new(title)
                         .font(FontId::new(19.0, FontFamily::Proportional))
                         .strong()
-                        .color(TEXT),
+                        .color(TEXT()),
                 )
                 .wrap()
                 .halign(Align::Center),
             );
             ui.add_space(5.0);
             ui.add(
-                egui::Label::new(egui::RichText::new(body).size(12.0).color(MUTED))
+                egui::Label::new(egui::RichText::new(body).size(12.0).color(MUTED()))
                     .wrap()
                     .halign(Align::Center),
             );
@@ -5381,14 +5731,14 @@ fn nav_row(
         let bar = Rect::from_min_size(pos2(rect.left(), rect.center().y - 9.0), vec2(3.0, 18.0));
         ui.painter().rect_filled(bar, Rounding::same(2.0), accent());
     } else if hovered {
-        ui.painter().rect_filled(rect, Rounding::same(9.0), CARD);
+        ui.painter().rect_filled(rect, Rounding::same(9.0), CARD());
     }
     let color = if selected {
         accent()
     } else if hovered {
-        TEXT
+        TEXT()
     } else {
-        MUTED
+        MUTED()
     };
     let icon_center = if compact {
         rect.center()
@@ -5408,7 +5758,7 @@ fn nav_row(
                 ui.painter().circle_filled(
                     pos2(rect.right() - 9.0, rect.top() + 9.0),
                     3.5,
-                    if selected { accent() } else { MUTED },
+                    if selected { accent() } else { MUTED() },
                 );
             }
         }
@@ -5434,7 +5784,7 @@ fn nav_row(
                     if selected {
                         Color32::from_rgb(14, 15, 21)
                     } else {
-                        MUTED
+                        MUTED()
                     },
                 );
                 let size = vec2(galley.size().x + 12.0, 18.0);
@@ -5445,7 +5795,7 @@ fn nav_row(
                 ui.painter().rect_filled(
                     badge_rect,
                     Rounding::same(5.0),
-                    if selected { accent() } else { CARD_HOVER },
+                    if selected { accent() } else { CARD_HOVER() },
                 );
                 ui.painter().galley(
                     badge_rect.center() - galley.size() * 0.5,
@@ -5453,7 +5803,7 @@ fn nav_row(
                     if selected {
                         Color32::from_rgb(14, 15, 21)
                     } else {
-                        MUTED
+                        MUTED()
                     },
                 );
             }
@@ -5493,7 +5843,7 @@ impl SidePanelLeft {
         egui::SidePanel::left("sidebar")
             .exact_width(width)
             .resizable(false)
-            .frame(Frame::none().fill(SIDEBAR).inner_margin(Margin {
+            .frame(Frame::none().fill(SIDEBAR()).inner_margin(Margin {
                 left: margin,
                 right: margin,
                 top: if compact { 18.0 } else { 22.0 },
@@ -5512,7 +5862,7 @@ impl SidePanelLeft {
                                 egui::RichText::new("DOUJIN")
                                     .size(15.0)
                                     .strong()
-                                    .color(TEXT),
+                                    .color(TEXT()),
                             );
                             ui.label(
                                 egui::RichText::new("EXPLORER")
@@ -5525,7 +5875,7 @@ impl SidePanelLeft {
                 }
                 ui.add_space(if compact { 22.0 } else { 28.0 });
                 if !compact {
-                    ui.label(egui::RichText::new(app.t("browse-section")).size(9.5).strong().color(DIM));
+                    ui.label(egui::RichText::new(app.t("browse-section")).size(9.5).strong().color(DIM()));
                     ui.add_space(7.0);
                 }
                 let items = [
@@ -5554,7 +5904,7 @@ impl SidePanelLeft {
 
                 ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
                     if compact {
-                        let cache = theme::icon_button(ui, Icon::Grid, 34.0, DIM);
+                        let cache = theme::icon_button(ui, Icon::Grid, 34.0, DIM());
                         cache.on_hover_text(format!("{cache_text} image cache"));
                         ui.add_space(8.0);
                         if nav_row(
@@ -5576,7 +5926,7 @@ impl SidePanelLeft {
                             app.t("desktop-client")
                         ))
                         .size(9.5)
-                        .color(DIM),
+                        .color(DIM()),
                     );
                     ui.add_space(8.0);
                     if nav_row(
@@ -5594,11 +5944,11 @@ impl SidePanelLeft {
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
                         let (rect, _) = ui.allocate_exact_size(vec2(13.0, 13.0), Sense::hover());
-                        theme::paint_icon(ui.painter(), rect, Icon::Grid, DIM, 1.2);
+                        theme::paint_icon(ui.painter(), rect, Icon::Grid, DIM(), 1.2);
                         ui.label(
                             egui::RichText::new(format!("{} {}", cache_text, app.t("image-cache")))
                                 .size(10.0)
-                                .color(DIM),
+                                .color(DIM()),
                         );
                     });
                     ui.add_space(8.0);
@@ -5628,7 +5978,7 @@ impl SidePanelLeft {
                             ui.label(
                                 egui::RichText::new(format!("{active} {}", app.t("downloads-active")))
                                     .size(10.0)
-                                    .color(MUTED),
+                                    .color(MUTED()),
                             );
                         });
                     }
@@ -5701,7 +6051,7 @@ fn draw_grid(
                         GridFooter::Loading(text) => {
                             ui.add(egui::Spinner::new().size(18.0).color(accent()));
                             ui.add_space(4.0);
-                            ui.label(egui::RichText::new(text).size(11.0).color(MUTED));
+                            ui.label(egui::RichText::new(text).size(11.0).color(MUTED()));
                         }
                         GridFooter::LoadMore(text) => {
                             if theme::secondary_button(ui, text).clicked() {
@@ -5709,7 +6059,7 @@ fn draw_grid(
                             }
                         }
                         GridFooter::End(text) => {
-                            ui.label(egui::RichText::new(text).size(11.0).color(DIM));
+                            ui.label(egui::RichText::new(text).size(11.0).color(DIM()));
                         }
                         GridFooter::None => {}
                     });
@@ -5780,15 +6130,15 @@ fn draw_card(
     let bg = if selected {
         Color32::from_rgb(25, 24, 38)
     } else if hovered {
-        CARD_HOVER
+        CARD_HOVER()
     } else {
-        CARD
+        CARD()
     };
     painter.rect_filled(rect, Rounding::same(12.0), bg);
     if selected {
         painter.rect_stroke(rect, Rounding::same(12.0), Stroke::new(1.0_f32, accent()));
     } else if hovered {
-        painter.rect_stroke(rect, Rounding::same(12.0), Stroke::new(1.0_f32, BORDER));
+        painter.rect_stroke(rect, Rounding::same(12.0), Stroke::new(1.0_f32, BORDER()));
     }
 
     let cover = Rect::from_min_size(
@@ -5892,7 +6242,7 @@ fn draw_card(
             if download_response.hovered() {
                 Color32::from_rgb(14, 15, 21)
             } else {
-                TEXT
+                TEXT()
             },
             1.6,
         );
@@ -5911,7 +6261,7 @@ fn draw_card(
             watch_rect,
             Rounding::same(8.0),
             if watch_response.hovered() {
-                CARD_HOVER
+                CARD_HOVER()
             } else {
                 Color32::from_black_alpha(145)
             },
@@ -5924,7 +6274,7 @@ fn draw_card(
             } else {
                 Icon::Star
             },
-            if watched { accent() } else { TEXT },
+            if watched { accent() } else { TEXT() },
             1.5,
         );
         if watch_response.clicked() {
@@ -5949,7 +6299,7 @@ fn draw_card(
     if downloaded {
         let owned_rect =
             Rect::from_min_size(cover.left_bottom() + vec2(8.0, -56.0), vec2(20.0, 20.0));
-        painter.rect_filled(owned_rect, Rounding::same(6.0), SUCCESS);
+        painter.rect_filled(owned_rect, Rounding::same(6.0), SUCCESS());
         theme::paint_icon(
             &painter,
             Rect::from_center_size(owned_rect.center(), vec2(12.0, 12.0)),
@@ -6015,13 +6365,13 @@ fn draw_card(
         let title_galley = painter.layout(
             album.title.clone(),
             FontId::new(12.8, FontFamily::Proportional),
-            TEXT,
+            TEXT(),
             text_width,
         );
         let title_clip = Rect::from_min_size(pos2(text_left, title_y), vec2(text_width, 34.0));
         painter
             .with_clip_rect(title_clip)
-            .galley(pos2(text_left, title_y), title_galley, TEXT);
+            .galley(pos2(text_left, title_y), title_galley, TEXT());
         let artist = if album.artist.trim().is_empty() {
             "Unknown artist"
         } else {
@@ -6033,7 +6383,7 @@ fn draw_card(
             Align2::LEFT_TOP,
             artist_text,
             FontId::proportional(10.8),
-            MUTED,
+            MUTED(),
         );
     }
 
@@ -6125,7 +6475,7 @@ fn draw_card(
 }
 
 fn elide_text(painter: &egui::Painter, text: &str, size: f32, max_width: f32) -> String {
-    let full = painter.layout_no_wrap(text.to_string(), FontId::proportional(size), MUTED);
+    let full = painter.layout_no_wrap(text.to_string(), FontId::proportional(size), MUTED());
     if full.size().x <= max_width {
         return text.to_string();
     }
@@ -6136,7 +6486,7 @@ fn elide_text(painter: &egui::Painter, text: &str, size: f32, max_width: f32) ->
         let mid = (low + high + 1) / 2;
         let candidate: String = chars[..mid].iter().collect::<String>() + "…";
         let width = painter
-            .layout_no_wrap(candidate.clone(), FontId::proportional(size), MUTED)
+            .layout_no_wrap(candidate.clone(), FontId::proportional(size), MUTED())
             .size()
             .x;
         if width <= max_width {
@@ -6219,11 +6569,11 @@ fn task_row(
     } else if matches!(task.state, DownloadState::Manual) {
         Color32::from_rgb(28, 25, 20)
     } else {
-        CARD
+        CARD()
     };
     Frame::none()
         .fill(frame_fill)
-        .stroke(Stroke::new(1.0_f32, BORDER_SOFT))
+        .stroke(Stroke::new(1.0_f32, BORDER_SOFT()))
         .rounding(Rounding::same(12.0))
         .inner_margin(Margin {
             left: 16.0,
@@ -6239,7 +6589,7 @@ fn task_row(
                             egui::RichText::new(&task.album.title)
                                 .size(13.4)
                                 .strong()
-                                .color(TEXT),
+                                .color(TEXT()),
                         )
                         .truncate()
                         .sense(Sense::click()),
@@ -6255,14 +6605,14 @@ fn task_row(
                                 task.album.artist.trim()
                             })
                             .size(11.0)
-                            .color(MUTED),
+                            .color(MUTED()),
                         )
                         .truncate(),
                     );
                     if let Some(host) = &task.host {
                         ui.add(
                             egui::Label::new(
-                                egui::RichText::new(host).size(9.5).color(DIM),
+                                egui::RichText::new(host).size(9.5).color(DIM()),
                             )
                             .truncate(),
                         );
@@ -6270,11 +6620,11 @@ fn task_row(
                 });
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     let state_color = match task.state {
-                        DownloadState::Done => SUCCESS,
-                        DownloadState::Failed => DANGER,
-                        DownloadState::Manual => WARNING,
-                        DownloadState::Paused => WARNING,
-                        DownloadState::Cancelled => MUTED,
+                        DownloadState::Done => SUCCESS(),
+                        DownloadState::Failed => DANGER(),
+                        DownloadState::Manual => WARNING(),
+                        DownloadState::Paused => WARNING(),
+                        DownloadState::Cancelled => MUTED(),
                         _ => accent(),
                     };
                     ui.label(
@@ -6285,18 +6635,18 @@ fn task_row(
                     );
                     ui.add_space(6.0);
                     if task.state == DownloadState::Queued {
-                        if theme::small_button(ui, "↓", MUTED).clicked() {
+                        if theme::small_button(ui, "↓", MUTED()).clicked() {
                             actions.push(TaskAction::MoveDown(task.id));
                         }
-                        if theme::small_button(ui, "↑", MUTED).clicked() {
+                        if theme::small_button(ui, "↑", MUTED()).clicked() {
                             actions.push(TaskAction::MoveUp(task.id));
                         }
-                        if theme::small_button(ui, "First", TEXT).clicked() {
+                        if theme::small_button(ui, "First", TEXT()).clicked() {
                             actions.push(TaskAction::Prioritize(task.id));
                         }
                     }
                     if task.state.is_terminal() {
-                        if theme::icon_button(ui, Icon::Trash, 26.0, DIM)
+                        if theme::icon_button(ui, Icon::Trash, 26.0, DIM())
                             .on_hover_text("Remove from list")
                             .clicked()
                         {
@@ -6322,23 +6672,23 @@ fn task_row(
                     } else {
                         store::human_size(downloaded)
                     };
-                    ui.label(egui::RichText::new(text).size(10.5).color(MUTED));
+                    ui.label(egui::RichText::new(text).size(10.5).color(MUTED()));
                     if task.state == DownloadState::Downloading && speed > 0.5 {
                         ui.label(
                             egui::RichText::new(format!("· {}/s", store::human_size(speed as u64)))
                                 .size(10.5)
-                                .color(DIM),
+                                .color(DIM()),
                         );
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if task.state == DownloadState::Paused {
-                            if theme::small_button(ui, "Resume", TEXT).clicked() {
+                            if theme::small_button(ui, "Resume", TEXT()).clicked() {
                                 actions.push(TaskAction::Resume(task.id));
                             }
-                        } else if theme::small_button(ui, "Pause", MUTED).clicked() {
+                        } else if theme::small_button(ui, "Pause", MUTED()).clicked() {
                             actions.push(TaskAction::Pause(task.id));
                         }
-                        if theme::small_button(ui, "Cancel", MUTED).clicked() {
+                        if theme::small_button(ui, "Cancel", MUTED()).clicked() {
                             actions.push(TaskAction::Cancel(task.id));
                         }
                         if task.state == DownloadState::Downloading {
@@ -6358,7 +6708,7 @@ fn task_row(
                                     ui.label(
                                         egui::RichText::new(format_eta(seconds))
                                             .size(10.0)
-                                            .color(DIM),
+                                            .color(DIM()),
                                     );
                                 }
                             }
@@ -6375,17 +6725,17 @@ fn task_row(
                         .map(|name| name.to_string_lossy().to_string())
                         .unwrap_or_else(|| "Download complete".into());
                     ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new(file_name).size(10.8).color(MUTED));
+                        ui.label(egui::RichText::new(file_name).size(10.8).color(MUTED()));
                         if let Some(folder) = &task.extracted {
-                            ui.label(egui::RichText::new("· extracted").size(10.0).color(SUCCESS));
+                            ui.label(egui::RichText::new("· extracted").size(10.0).color(SUCCESS()));
                             let _ = folder;
                         }
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if theme::small_button(ui, "Show in folder", TEXT).clicked() {
+                            if theme::small_button(ui, "Show in folder", TEXT()).clicked() {
                                 actions.push(TaskAction::OpenFolder(task.id));
                             }
                             if task.extracted.as_ref().map(|p| p.exists()).unwrap_or(false) || task.output.as_ref().map(|p| p.exists()).unwrap_or(false) {
-                                if theme::small_button(ui, "Play in foobar", TEXT).clicked() {
+                                if theme::small_button(ui, "Play in foobar", TEXT()).clicked() {
                                     let path = task.extracted.clone().unwrap_or_else(|| task.output.clone().unwrap());
                                     actions.push(TaskAction::PlayInFoobar(path));
                                 }
@@ -6399,26 +6749,26 @@ fn task_row(
                         .unwrap_or_else(|| "This download stopped.".into());
                     ui.label(egui::RichText::new(message).size(10.8).color(
                         if task.state == DownloadState::Failed {
-                            DANGER
+                            DANGER()
                         } else {
-                            MUTED
+                            MUTED()
                         },
                     ));
                     ui.add_space(5.0);
                     ui.horizontal(|ui| {
                         if task.state == DownloadState::Manual {
                             if let Some(url) = &task.manual_url {
-                                if theme::small_button(ui, "Open host page", WARNING).clicked() {
+                                if theme::small_button(ui, "Open host page", WARNING()).clicked() {
                                     actions.push(TaskAction::OpenUrl(url.clone()));
                                 }
                             }
                         }
-                        if theme::small_button(ui, "Retry", TEXT).clicked() {
+                        if theme::small_button(ui, "Retry", TEXT()).clicked() {
                             actions.push(TaskAction::Retry(task.id));
                         }
                         if task.state == DownloadState::Manual {
                             if let Some(url) = &task.manual_url {
-                                if theme::small_button(ui, "Copy link", MUTED).clicked() {
+                                if theme::small_button(ui, "Copy link", MUTED()).clicked() {
                                     ui.ctx().copy_text(url.clone());
                                 }
                             }
@@ -6427,10 +6777,63 @@ fn task_row(
                 }
                 if let Some(warning) = &task.warning {
                     ui.add_space(4.0);
-                    ui.label(egui::RichText::new(warning).size(10.2).color(WARNING));
+                    ui.label(egui::RichText::new(warning).size(10.2).color(WARNING()));
                 }
             }
         });
+}
+
+fn track_time(seconds: f32) -> String {
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return "0:00".to_string();
+    }
+    let total = seconds.round() as u64;
+    format!("{}:{:02}", total / 60, total % 60)
+}
+
+/// Draw a compact waveform with elapsed bars highlighted in the accent colour.
+fn paint_waveform(painter: &egui::Painter, rect: Rect, peaks: &[f32], progress: f32) {
+    painter.rect_filled(rect, Rounding::same(7.0), CARD());
+    painter.rect_stroke(
+        rect,
+        Rounding::same(7.0),
+        Stroke::new(1.0_f32, BORDER_SOFT()),
+    );
+    let progress = progress.clamp(0.0, 1.0);
+    let play_x = rect.left() + rect.width() * progress;
+    let bars = if peaks.is_empty() {
+        64
+    } else {
+        peaks.len().min((rect.width() / 3.0).max(16.0) as usize)
+    };
+    let gap = 1.0f32;
+    let bar_width = ((rect.width() - 8.0) / bars as f32 - gap).max(1.0);
+    let mid = rect.center().y;
+    let max_height = rect.height() - 10.0;
+    for index in 0..bars {
+        let amplitude = if peaks.is_empty() {
+            0.16
+        } else {
+            let position = index * peaks.len() / bars;
+            peaks[position.min(peaks.len() - 1)]
+        };
+        let height = (amplitude * max_height).max(1.5);
+        let x = rect.left() + 4.0 + index as f32 * (bar_width + gap);
+        let color = if x <= play_x {
+            accent()
+        } else {
+            MUTED().gamma_multiply(0.45)
+        };
+        painter.rect_filled(
+            Rect::from_center_size(pos2(x + bar_width * 0.5, mid), vec2(bar_width, height)),
+            Rounding::same(1.0),
+            color,
+        );
+    }
+    painter.line_segment(
+        [pos2(play_x, rect.top() + 3.0), pos2(play_x, rect.bottom() - 3.0)],
+        Stroke::new(1.5_f32, accent()),
+    );
 }
 
 fn format_eta(seconds: f32) -> String {
@@ -6445,11 +6848,11 @@ fn format_eta(seconds: f32) -> String {
 }
 
 fn settings_card(ui: &mut Ui, title: impl Into<String>, contents: impl FnOnce(&mut Ui)) {
-    ui.label(egui::RichText::new(title.into()).size(12.5).strong().color(TEXT));
+    ui.label(egui::RichText::new(title.into()).size(12.5).strong().color(TEXT()));
     ui.add_space(6.0);
     Frame::none()
-        .fill(PANEL)
-        .stroke(Stroke::new(1.0_f32, BORDER_SOFT))
+        .fill(PANEL())
+        .stroke(Stroke::new(1.0_f32, BORDER_SOFT()))
         .rounding(Rounding::same(12.0))
         .inner_margin(Margin::same(16.0))
         .show(ui, contents);
@@ -6463,6 +6866,7 @@ fn draw_detail(
     in_library: bool,
     folders: &[String],
     watch_meta: Option<&mut WatchMeta>,
+    playable: Option<(PathBuf, PathBuf)>,
     requests: &mut Vec<ImageSpec>,
 ) -> Vec<DetailAction> {
     let mut actions = Vec::new();
@@ -6474,7 +6878,7 @@ fn draw_detail(
                 .color(accent()),
         );
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if theme::icon_button(ui, Icon::Close, 30.0, MUTED)
+            if theme::icon_button(ui, Icon::Close, 30.0, MUTED())
                 .on_hover_text("Close (Esc)")
                 .clicked()
             {
@@ -6537,7 +6941,7 @@ fn draw_detail(
                     egui::RichText::new(&album.title)
                         .font(FontId::new(21.0, FontFamily::Proportional))
                         .strong()
-                        .color(TEXT),
+                        .color(TEXT()),
                 )
                 .wrap(),
             );
@@ -6547,7 +6951,7 @@ fn draw_detail(
                     egui::Label::new(
                         egui::RichText::new(album.artist.trim())
                             .size(12.2)
-                            .color(MUTED),
+                            .color(MUTED()),
                     )
                     .wrap(),
                 );
@@ -6559,14 +6963,14 @@ fn draw_detail(
                 }
                 if let Some(loaded) = &detail.loaded {
                     if !loaded.date_added.is_empty() {
-                        theme::badge(ui, &loaded.date_added, MUTED, CARD);
+                        theme::badge(ui, &loaded.date_added, MUTED(), CARD());
                     }
                 }
                 if album.is_new {
                     theme::badge(ui, "NEW", Color32::from_rgb(14, 15, 21), accent());
                 }
                 if in_library {
-                    theme::badge(ui, "IN LIBRARY", SUCCESS, Color32::from_rgb(20, 38, 30));
+                    theme::badge(ui, "IN LIBRARY", SUCCESS(), Color32::from_rgb(20, 38, 30));
                 }
             });
             ui.add_space(13.0);
@@ -6594,7 +6998,7 @@ fn draw_detail(
                         Icon::Star
                     },
                     36.0,
-                    if watched { accent() } else { MUTED },
+                    if watched { accent() } else { MUTED() },
                 )
                 .on_hover_text(if watched {
                     "Remove from watchlist"
@@ -6605,11 +7009,22 @@ fn draw_detail(
                 {
                     actions.push(DetailAction::ToggleWatch(album.clone()));
                 }
-                if theme::icon_button(ui, Icon::External, 36.0, MUTED)
+                if theme::icon_button(ui, Icon::External, 36.0, MUTED())
                     .on_hover_text("Open album page in browser")
                     .clicked()
                 {
                     actions.push(DetailAction::OpenUrl(album.page_url()));
+                }
+                if let Some((folder, source)) = &playable {
+                    if theme::icon_button(ui, Icon::Play, 36.0, accent())
+                        .on_hover_text("Play in DST-Explorer")
+                        .clicked()
+                    {
+                        actions.push(DetailAction::Play {
+                            folder: folder.clone(),
+                            source: source.clone(),
+                        });
+                    }
                 }
             });
             // Download by tag/artist
@@ -6645,12 +7060,12 @@ fn draw_detail(
                     egui::RichText::new("WATCHLIST")
                         .size(9.5)
                         .strong()
-                        .color(DIM),
+                        .color(DIM()),
                 );
                 ui.add_space(3.0);
                 let mut changed = false;
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("Folder").size(11.0).color(MUTED));
+                    ui.label(egui::RichText::new("Folder").size(11.0).color(MUTED()));
                     let selected = meta
                         .folder
                         .clone()
@@ -6704,7 +7119,7 @@ fn draw_detail(
                     ui.label(
                         egui::RichText::new("Loading details…")
                             .size(11.0)
-                            .color(MUTED),
+                            .color(MUTED()),
                     );
                 });
             }
@@ -6716,8 +7131,8 @@ fn draw_detail(
                     .rounding(Rounding::same(8.0))
                     .inner_margin(Margin::same(10.0))
                     .show(ui, |ui| {
-                        ui.label(egui::RichText::new(error).size(10.8).color(DANGER));
-                        if theme::small_button(ui, "Retry", TEXT).clicked() {
+                        ui.label(egui::RichText::new(error).size(10.8).color(DANGER()));
+                        if theme::small_button(ui, "Retry", TEXT()).clicked() {
                             actions.push(DetailAction::Retry);
                         }
                     });
@@ -6727,7 +7142,7 @@ fn draw_detail(
                 ui.add_space(15.0);
                 ui.separator();
                 ui.add_space(10.0);
-                ui.label(egui::RichText::new("DETAILS").size(9.5).strong().color(DIM));
+                ui.label(egui::RichText::new("DETAILS").size(9.5).strong().color(DIM()));
                 ui.add_space(6.0);
                 egui::Grid::new("detail-meta-grid")
                     .num_columns(2)
@@ -6770,7 +7185,7 @@ fn draw_detail(
                             },
                         );
                         if let Some(provider) = &loaded.provider {
-                            ui.label(egui::RichText::new("Provider").size(11.0).color(DIM));
+                            ui.label(egui::RichText::new("Provider").size(11.0).color(DIM()));
                             if ui
                                 .add(
                                     egui::Label::new(
@@ -6791,7 +7206,7 @@ fn draw_detail(
 
                 if !loaded.artists.is_empty() {
                     ui.add_space(12.0);
-                    ui.label(egui::RichText::new("ARTISTS").size(9.5).strong().color(DIM));
+                    ui.label(egui::RichText::new("ARTISTS").size(9.5).strong().color(DIM()));
                     ui.add_space(5.0);
                     ui.horizontal_wrapped(|ui| {
                         for artist in &loaded.artists {
@@ -6807,7 +7222,7 @@ fn draw_detail(
 
                 if !loaded.tags.is_empty() {
                     ui.add_space(12.0);
-                    ui.label(egui::RichText::new("TAGS").size(9.5).strong().color(DIM));
+                    ui.label(egui::RichText::new("TAGS").size(9.5).strong().color(DIM()));
                     ui.add_space(5.0);
                     ui.horizontal_wrapped(|ui| {
                         for tag in &loaded.tags {
@@ -6850,7 +7265,7 @@ fn draw_detail(
             ui.label(
                 egui::RichText::new(format!("DoujinStyle album #{}", album.id))
                     .size(9.5)
-                    .color(DIM),
+                    .color(DIM()),
             );
             ui.add_space(20.0);
         });
@@ -6859,8 +7274,8 @@ fn draw_detail(
 }
 
 fn meta_row(ui: &mut Ui, label: &str, value: &str) {
-    ui.label(egui::RichText::new(label).size(11.0).color(DIM));
-    ui.label(egui::RichText::new(value).size(11.5).color(TEXT));
+    ui.label(egui::RichText::new(label).size(11.0).color(DIM()));
+    ui.label(egui::RichText::new(value).size(11.5).color(TEXT()));
     ui.end_row();
 }
 
@@ -6868,7 +7283,7 @@ fn shortcut_row(ui: &mut Ui, key: &str, description: &str) {
     ui.horizontal(|ui| {
         let galley = ui
             .painter()
-            .layout_no_wrap(key.to_string(), FontId::proportional(11.0), DIM);
+            .layout_no_wrap(key.to_string(), FontId::proportional(11.0), DIM());
         let key_width = galley.size().x + 16.0;
         let (rect, _) = ui.allocate_exact_size(vec2(key_width, 22.0), Sense::hover());
         ui.painter().rect_filled(
@@ -6879,15 +7294,15 @@ fn shortcut_row(ui: &mut Ui, key: &str, description: &str) {
         ui.painter().rect_stroke(
             rect,
             Rounding::same(4.0),
-            Stroke::new(1.0_f32, BORDER_SOFT),
+            Stroke::new(1.0_f32, BORDER_SOFT()),
         );
         ui.painter().galley(
             rect.center() - galley.size() * 0.5,
             galley,
-            MUTED,
+            MUTED(),
         );
         ui.add_space(12.0);
-        ui.label(egui::RichText::new(description).size(11.5).color(TEXT));
+        ui.label(egui::RichText::new(description).size(11.5).color(TEXT()));
     });
     ui.add_space(2.0);
 }

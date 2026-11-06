@@ -12,6 +12,7 @@ mod taskbar;
 mod theme;
 mod tray;
 mod tui;
+mod audio;
 
 use app::App;
 use eframe::egui;
