@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this format.
 
 ## [Unreleased]
 
+## [1.3.2] - 2026-11-08
+
+### Fixed
+- Player timeline no longer freezes at 0:00 after the gapless transition to the
+  next track; playback position is read relative to the track that is playing
+- Seeking (click or drag on the waveform, Ctrl+Shift+Left/Right) now jumps
+  within the current track on later tracks instead of past its end
+- Previous-track now restarts the current track after a gapless switch, because
+  the position is reported correctly again
+
 ## [1.3.1] - 2026-11-08
 
 ### Changed

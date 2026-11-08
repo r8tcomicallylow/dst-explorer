@@ -117,8 +117,6 @@ pub struct AudioPlayer {
     queue: Vec<Track>,
     current: Option<usize>,
     state: PlaybackState,
-    /// Absolute sink position where the current track starts (gapless pre-roll).
-    track_offset: f32,
     /// True when the next track was already appended to the sink.
     prefetched: bool,
     prefetched_index: Option<usize>,
@@ -148,7 +146,6 @@ impl AudioPlayer {
             queue: Vec::new(),
             current: None,
             state: PlaybackState::Stopped,
-            track_offset: 0.0,
             prefetched: false,
             prefetched_index: None,
             queue_folder: None,
@@ -249,9 +246,13 @@ impl AudioPlayer {
     }
 
     pub fn position(&self) -> f32 {
+        // rodio reports the position of the *current* appended source, so it is
+        // already relative to the track that is playing. Do not subtract a
+        // cumulative offset here: after a gapless transition the new source
+        // restarts at zero.
         self.sink
             .as_ref()
-            .map(|sink| (sink.get_pos().as_secs_f32() - self.track_offset).max(0.0))
+            .map(|sink| sink.get_pos().as_secs_f32())
             .unwrap_or(self.resume_at)
     }
 
@@ -322,7 +323,6 @@ impl AudioPlayer {
         );
         self.queue_folder = Some(folder.to_path_buf());
         self.resume_at = position.max(0.0);
-        self.track_offset = 0.0;
         self.prefetched = false;
         self.prefetched_index = None;
         if let Some(sink) = self.sink.take() {
@@ -384,7 +384,6 @@ impl AudioPlayer {
         self.state = PlaybackState::Stopped;
         self.current = None;
         self.queue.clear();
-        self.track_offset = 0.0;
         self.prefetched = false;
         self.prefetched_index = None;
         self.resume_at = 0.0;
@@ -463,10 +462,9 @@ impl AudioPlayer {
         let Some(sink) = &self.sink else {
             return Ok(());
         };
-        // `try_seek` works on the whole sink timeline. After a gapless
-        // transition the current track starts at `track_offset`, so the
-        // requested track-relative position has to be shifted by it.
-        sink.try_seek(Duration::from_secs_f32(self.track_offset + target))
+        // rodio's `try_seek` seeks the source that is currently being played,
+        // not the whole sink timeline, so the target is already track-relative.
+        sink.try_seek(Duration::from_secs_f32(target))
             .map_err(|error| format!("Seek failed: {error}"))
     }
 
@@ -489,13 +487,11 @@ impl AudioPlayer {
         if self.state != PlaybackState::Playing {
             return;
         }
-        let (absolute, elapsed, duration, empty) = {
+        let (elapsed, duration, empty) = {
             let Some(sink) = &self.sink else {
                 return;
             };
-            let absolute = sink.get_pos().as_secs_f32();
-            let elapsed = (absolute - self.track_offset).max(0.0);
-            (absolute, elapsed, self.duration(), sink.empty())
+            (sink.get_pos().as_secs_f32(), self.duration(), sink.empty())
         };
         let Some(current) = self.current else {
             return;
@@ -541,8 +537,10 @@ impl AudioPlayer {
                 if next == current {
                     let _ = self.start_current();
                 } else if self.prefetched {
+                    // The sink is already playing the prefetched track; its
+                    // position source restarted at zero, so there is no offset
+                    // to carry over.
                     self.current = Some(next);
-                    self.track_offset = absolute;
                     self.prefetched = false;
                     if let Some(track) = self.queue.get(next) {
                         self.request_waveform(track.path.clone());
@@ -645,7 +643,6 @@ impl AudioPlayer {
         }
         self.sink = Some(sink);
         self.state = PlaybackState::Playing;
-        self.track_offset = 0.0;
         self.prefetched = false;
         self.prefetched_index = None;
         self.error = None;
@@ -826,6 +823,45 @@ mod tests {
         assert!(!waveform.peaks.is_empty());
         assert!(waveform.peaks.iter().all(|peak| (0.0..=1.0).contains(peak)));
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sink_position_restarts_for_prefetched_track() {
+        // rodio's Sink reports the position of the source that is currently
+        // playing. A prefetched track is a separate source, so its position
+        // starts at zero again; the player must not subtract a cumulative
+        // offset (that used to freeze the timeline after a gapless switch).
+        let first = std::env::temp_dir().join("dst-explorer-audio-pos-1.wav");
+        let second = std::env::temp_dir().join("dst-explorer-audio-pos-2.wav");
+        write_test_wav(&first);
+        write_test_wav(&second);
+
+        let (sink, mut output) = rodio::Sink::new_idle();
+        sink.append(open_decoder(&first).expect("first wav should decode"));
+        for _ in 0..8_000 {
+            let _ = output.next();
+        }
+        let position = sink.get_pos().as_secs_f32();
+        assert!(
+            (position - 1.0).abs() < 0.15,
+            "first track position {position}"
+        );
+
+        sink.append(open_decoder(&second).expect("second wav should decode"));
+        // Finish the remaining second of the first track, then play 0.25 s of
+        // the second one.
+        for _ in 0..10_000 {
+            let _ = output.next();
+        }
+        let position = sink.get_pos().as_secs_f32();
+        assert!(
+            position < 0.6,
+            "gapless position should restart at zero, got {position}"
+        );
+
+        drop(sink);
+        let _ = std::fs::remove_file(first);
+        let _ = std::fs::remove_file(second);
     }
 
     fn write_test_wav(path: &Path) {
