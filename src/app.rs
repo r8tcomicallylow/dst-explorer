@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use eframe::egui::{
-    self, pos2, vec2, Align, Align2, Color32, FontFamily, FontId, Frame, Id, Layout, Margin, Rect,
-    Response, Rounding, ScrollArea, Sense, Stroke, TextEdit, Ui, Vec2,
+    self, pos2, vec2, Align, Align2, Color32, FontFamily, FontId, Frame, Id, Layout, Margin, Mesh,
+    Pos2, Rect, Response, Rounding, ScrollArea, Sense, Shape, Stroke, TextEdit, Ui, Vec2,
 };
 
 use crate::api::{self, FeedPage, SearchParams};
@@ -15,14 +15,14 @@ use crate::downloads::{DownloadManager, DownloadNotice, DownloadState};
 use crate::i18n::{negotiate_best_language, I18n, Language};
 use crate::images::{ImageLoader, ImageSpec, Textures};
 use crate::models::{
-    is_lossless_format, sort_albums, Album, AlbumDetail, FormatFilter, LibraryEntry, LibrarySort,
-    Persisted, RepeatMode, RuleField, SaveRule, SearchHistoryEntry, SearchKind, SearchSort,
-    WatchMeta,
+    is_lossless_format, sort_albums, Album, AlbumDetail, EffectsQuality, FormatFilter,
+    LibraryEntry, LibrarySort, Persisted, RepeatMode, RuleField, SaveRule, SearchHistoryEntry,
+    SearchKind, SearchSort, WatchMeta,
 };
 use crate::store;
 use crate::theme::{
-    self, accent, accent_dim, Icon, ACCENTS, BG, BORDER, BORDER_SOFT, CARD, CARD_HOVER, DANGER,
-    DIM, MUTED, PANEL, SIDEBAR, SUCCESS, TEXT, WARNING,
+    self, accent, accent_dark, accent_dim, Icon, ACCENTS, BG, BORDER, BORDER_SOFT, CARD,
+    CARD_HOVER, DANGER, DIM, MUTED, PANEL, SIDEBAR, SUCCESS, TEXT, WARNING,
 };
 use crate::tray::{Tray, TrayAction};
 
@@ -54,6 +54,118 @@ fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
         mix(a.b(), b.b()),
         mix(a.a(), b.a()),
     )
+}
+
+/// Translucent version of a palette colour, used for the frosted-glass panels.
+fn glass_fill(base: Color32, alpha: u8) -> Color32 {
+    Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), alpha)
+}
+
+fn soft_shadow(offset: Vec2, blur: f32) -> egui::epaint::Shadow {
+    egui::epaint::Shadow {
+        offset,
+        blur,
+        spread: 0.0,
+        color: Color32::from_black_alpha(80),
+    }
+}
+
+/// Whether the window currently has keyboard focus. Animation timers are
+/// suspended while it does not, so a minimised or background window stays idle.
+fn window_focused(ctx: &egui::Context) -> bool {
+    ctx.input(|input| input.viewport().focused.unwrap_or(true))
+}
+
+/// Radial glow made from a single triangle fan. No shaders, no blur passes.
+fn paint_soft_glow(
+    painter: &egui::Painter,
+    center: Pos2,
+    radius: Vec2,
+    color: Color32,
+    strength: f32,
+) {
+    if radius.x <= 0.0 || radius.y <= 0.0 || strength <= 0.0 {
+        return;
+    }
+    let alpha = (strength.clamp(0.0, 1.0) * 255.0) as u8;
+    if alpha == 0 {
+        return;
+    }
+    const SEGMENTS: usize = 24;
+    let mut mesh = Mesh::default();
+    mesh.colored_vertex(
+        center,
+        Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha),
+    );
+    for index in 0..SEGMENTS {
+        let angle = index as f32 / SEGMENTS as f32 * std::f32::consts::TAU;
+        mesh.colored_vertex(
+            center + vec2(angle.cos() * radius.x, angle.sin() * radius.y),
+            Color32::TRANSPARENT,
+        );
+    }
+    for index in 0..SEGMENTS {
+        let a = 1 + index as u32;
+        let b = 1 + ((index + 1) % SEGMENTS) as u32;
+        mesh.add_triangle(0, a, b);
+    }
+    painter.add(Shape::mesh(mesh));
+}
+
+/// Slow, low-alpha aurora used behind empty states. Three drifting glows are
+/// enough to suggest motion without a shader or a blur pass.
+fn paint_aurora(painter: &egui::Painter, rect: Rect, time: f32) {
+    let a = accent();
+    let secondary = accent_dark();
+    let t = time * 0.12;
+    let blobs = [
+        (0.24 + (t * 1.3).sin() * 0.08, 0.30, 0.55, a, 0.10),
+        (
+            0.74 + (t * 0.9 + 2.1).cos() * 0.10,
+            0.62,
+            0.62,
+            secondary,
+            0.12,
+        ),
+        (0.48 + (t * 0.6 + 4.0).sin() * 0.16, 0.18, 0.40, a, 0.07),
+    ];
+    for (fx, fy, radius, color, alpha) in blobs {
+        paint_soft_glow(
+            painter,
+            pos2(
+                rect.left() + rect.width() * fx,
+                rect.top() + rect.height() * fy,
+            ),
+            vec2(rect.width() * radius, rect.height() * radius * 0.85),
+            color,
+            alpha,
+        );
+    }
+}
+
+/// Diagonal translucent band that appears when a card is hovered.
+fn paint_light_sweep(painter: &egui::Painter, rect: Rect, strength: f32) {
+    let alpha = (28.0 * strength.clamp(0.0, 1.0)) as u8;
+    if alpha == 0 {
+        return;
+    }
+    let width = rect.width() * 0.32;
+    let left = rect.left() - rect.height() * 0.35;
+    let mut mesh = Mesh::default();
+    let color = Color32::from_white_alpha(alpha);
+    mesh.colored_vertex(pos2(left, rect.top()), Color32::TRANSPARENT);
+    mesh.colored_vertex(pos2(left + width, rect.top()), color);
+    mesh.colored_vertex(
+        pos2(left + width + rect.height() * 0.35, rect.bottom()),
+        color,
+    );
+    mesh.colored_vertex(
+        pos2(left + rect.height() * 0.35, rect.bottom()),
+        Color32::TRANSPARENT,
+    );
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(0, 2, 3);
+    painter.with_clip_rect(rect).add(Shape::mesh(mesh));
 }
 
 fn hash_time(seed: u64) -> u64 {
@@ -471,9 +583,29 @@ pub struct App {
     tray_tooltip_at: Instant,
     scale_dragging: bool,
     scrub_fraction: Option<f32>,
+
+    // Frame pacing diagnostics (`DST_FPS=1`)
+    fps_enabled: bool,
+    fps_frames: u32,
+    fps_since: Instant,
+    fps_value: f32,
+    fps_frame_ms: f32,
 }
 
 impl App {
+    fn effects_enabled(&self) -> bool {
+        self.persisted.settings.effects != EffectsQuality::Off
+    }
+
+    fn effects_full(&self) -> bool {
+        self.persisted.settings.effects == EffectsQuality::Full
+    }
+
+    /// Full effects with motion allowed (shimmer, aurora, equalizer, confetti).
+    fn motion_enabled(&self) -> bool {
+        self.effects_full() && !self.persisted.settings.reduce_motion
+    }
+
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         theme::install_fonts(&cc.egui_ctx);
         store::ensure_dirs();
@@ -575,6 +707,11 @@ impl App {
             tray_tooltip_at: Instant::now(),
             scale_dragging: false,
             scrub_fraction: None,
+            fps_enabled: std::env::var_os("DST_FPS").is_some(),
+            fps_frames: 0,
+            fps_since: Instant::now(),
+            fps_value: 0.0,
+            fps_frame_ms: 0.0,
         };
         app.refresh_latest();
         app.sync_library_from_downloads();
@@ -1437,6 +1574,10 @@ impl App {
     }
 
     fn draw_confetti(&mut self, ctx: &egui::Context) {
+        if !self.motion_enabled() {
+            self.confetti = None;
+            return;
+        }
         let Some((start, particles)) = self.confetti.take() else {
             return;
         };
@@ -1925,7 +2066,9 @@ impl App {
 
     fn request_images(&mut self, requests: Vec<ImageSpec>) {
         for spec in requests {
-            self.images.request(spec);
+            if self.images.wants(&spec.key) {
+                self.images.request(spec);
+            }
         }
     }
 
@@ -2158,6 +2301,8 @@ impl App {
             .iter()
             .find(|entry| entry.album.id == album_id)
             .map(|entry| (entry.folder(), entry.path.clone()));
+        let effects = self.effects_enabled();
+        let motion = self.motion_enabled();
         let persisted = &mut self.persisted;
         let watch_meta = if watched {
             Some(persisted.watch_meta.entry(album_id).or_default())
@@ -2173,12 +2318,17 @@ impl App {
                 .resizable(true)
                 .default_width(default_width)
                 .width_range(280.0..=520.0)
-                .frame(Frame::none().fill(PANEL()).inner_margin(Margin {
-                    left: detail_margin,
-                    right: detail_margin,
-                    top: if compact { 14.0 } else { 18.0 },
-                    bottom: 16.0,
-                }))
+                .frame(
+                    Frame::none()
+                        .fill(glass_fill(PANEL(), 246))
+                        .shadow(soft_shadow(vec2(-4.0, 0.0), 18.0))
+                        .inner_margin(Margin {
+                            left: detail_margin,
+                            right: detail_margin,
+                            top: if compact { 14.0 } else { 18.0 },
+                            bottom: 16.0,
+                        }),
+                )
                 .show(ctx, |ui| {
                     ui.set_opacity(0.08 + 0.92 * anim);
                     let slide = (1.0 - ease_out(anim)) * 14.0;
@@ -2195,6 +2345,8 @@ impl App {
                         watch_meta,
                         playable,
                         &mut requests,
+                        effects,
+                        motion,
                     );
                 });
         }
@@ -2217,8 +2369,9 @@ impl App {
             .exact_height(if narrow { 96.0 } else { 66.0 })
             .frame(
                 Frame::none()
-                    .fill(PANEL())
+                    .fill(glass_fill(PANEL(), 246))
                     .stroke(Stroke::new(1.0_f32, BORDER_SOFT()))
+                    .shadow(soft_shadow(vec2(0.0, -3.0), 16.0))
                     .inner_margin(Margin {
                         left: pad,
                         right: pad,
@@ -2382,14 +2535,16 @@ impl App {
         let cover_tex = cover_key
             .as_deref()
             .and_then(|key| self.textures.get(key).cloned());
+        let cover_tint = cover_key.as_deref().and_then(|key| self.textures.tint(key));
         let mut need_cover = false;
         let mut open_album: Option<Album> = None;
         egui::TopBottomPanel::bottom("player-bar")
             .exact_height(92.0 * anim)
             .frame(
                 Frame::none()
-                    .fill(PANEL())
+                    .fill(glass_fill(PANEL(), 244))
                     .stroke(Stroke::new(1.0_f32, BORDER_SOFT()))
+                    .shadow(soft_shadow(vec2(0.0, -3.0), 16.0))
                     .inner_margin(Margin {
                         left: 18.0,
                         right: 18.0,
@@ -2398,6 +2553,18 @@ impl App {
                     }),
             )
             .show(ctx, |ui| {
+                if self.effects_enabled() {
+                    if let Some(tint) = cover_tint {
+                        let panel = ui.max_rect();
+                        paint_soft_glow(
+                            ui.painter(),
+                            pos2(panel.center().x, panel.top() + panel.height() * 0.35),
+                            vec2(panel.width() * 0.55, panel.height() * 1.4),
+                            tint,
+                            0.12,
+                        );
+                    }
+                }
                 ui.set_opacity(anim);
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 8.0;
@@ -2407,13 +2574,18 @@ impl App {
                     if let Some(texture) = &cover_tex {
                         paint_texture_cover(painter, cover_rect, texture, Rounding::same(7.0), 1.0);
                     } else if let Some(album) = &album {
+                        let failed = self
+                            .textures
+                            .is_failed(cover_key.as_deref().unwrap_or_default());
+                        let shimmer = !failed && self.motion_enabled();
                         paint_cover_placeholder(
                             painter,
                             cover_rect,
                             &album.title,
                             ui.input(|i| i.time) as f32,
+                            shimmer,
                         );
-                        need_cover = true;
+                        need_cover = !failed;
                     } else {
                         painter.rect_filled(cover_rect, Rounding::same(7.0), CARD());
                     }
@@ -2447,22 +2619,18 @@ impl App {
                                 .track_title()
                                 .map(|title| title.to_string())
                                 .unwrap_or_else(|| "Audio".to_string());
-                            ui.label(
-                                egui::RichText::new(elide_text(ui.painter(), &title, 12.5, 152.0))
-                                    .size(12.5)
-                                    .strong()
-                                    .color(TEXT()),
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(title).size(12.5).strong().color(TEXT()),
+                                )
+                                .truncate(),
                             );
                             if let Some(error) = self.player.error() {
-                                ui.label(
-                                    egui::RichText::new(elide_text(
-                                        ui.painter(),
-                                        error,
-                                        10.0,
-                                        152.0,
-                                    ))
-                                    .size(10.0)
-                                    .color(DANGER()),
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(error).size(10.0).color(DANGER()),
+                                    )
+                                    .truncate(),
                                 );
                             } else {
                                 let index = self.player.queue_index().unwrap_or(0) + 1;
@@ -2586,7 +2754,11 @@ impl App {
                         .map(|fraction| fraction * duration)
                         .unwrap_or_else(|| self.player.position());
                     // Keep redrawing while dragging / playing so the playhead stays smooth.
-                    if response.hovered() || self.player.is_playing() || self.scrub_fraction.is_some() {
+                    if (response.hovered()
+                        || self.player.is_playing()
+                        || self.scrub_fraction.is_some())
+                        && window_focused(ctx)
+                    {
                         ctx.request_repaint_after(Duration::from_millis(100));
                     }
                     ui.add_space(6.0);
@@ -2646,7 +2818,7 @@ impl App {
         if stop {
             self.player.stop();
         }
-        if self.player.is_playing() {
+        if self.player.is_playing() && window_focused(ctx) {
             ctx.request_repaint_after(Duration::from_millis(200));
         }
     }
@@ -2704,6 +2876,19 @@ impl App {
                 ui.set_opacity(0.1 + 0.9 * anim);
                 if slide > 0.2 {
                     ui.add_space(slide);
+                }
+                let empty = match self.view {
+                    View::Discover => self.latest.is_empty(),
+                    View::Search => self.search.searched && self.search.display.is_empty(),
+                    _ => false,
+                };
+                if empty && self.motion_enabled() {
+                    let rect = ui.max_rect();
+                    let time = ui.input(|i| i.time) as f32;
+                    paint_aurora(ui.painter(), rect, time);
+                    if window_focused(ui.ctx()) {
+                        ui.ctx().request_repaint_after(Duration::from_millis(33));
+                    }
                 }
                 match self.view {
                     View::Discover => self.view_discover(ui),
@@ -2828,6 +3013,8 @@ impl App {
         };
 
         let mut requests = Vec::new();
+        let effects = self.effects_enabled();
+        let motion = self.motion_enabled();
         let (actions, near_bottom) = draw_grid(
             ui,
             &self.latest,
@@ -2843,6 +3030,8 @@ impl App {
             self.persisted.settings.compact_grid,
             &format!("latest-{}", self.latest_gen),
             self.player.queue_folder(),
+            effects,
+            motion,
         );
         self.request_images(requests);
         let load_more = actions.iter().any(|a| matches!(a, CardAction::LoadMore));
@@ -3333,6 +3522,8 @@ impl App {
         };
 
         let mut requests = Vec::new();
+        let effects = self.effects_enabled();
+        let motion = self.motion_enabled();
         let (actions, near_bottom) = draw_grid(
             ui,
             &self.search.display,
@@ -3348,6 +3539,8 @@ impl App {
             self.persisted.settings.compact_grid,
             &format!("search-{}", self.search.gen),
             self.player.queue_folder(),
+            effects,
+            motion,
         );
         self.request_images(requests);
         let load_more = actions.iter().any(|a| matches!(a, CardAction::LoadMore));
@@ -3608,6 +3801,8 @@ impl App {
         }
 
         let mut requests = Vec::new();
+        let effects = self.effects_enabled();
+        let motion = self.motion_enabled();
         let (actions, _) = draw_grid(
             ui,
             &visible,
@@ -3623,6 +3818,8 @@ impl App {
             self.persisted.settings.compact_grid,
             "watchlist",
             self.player.queue_folder(),
+            effects,
+            motion,
         );
         self.request_images(requests);
         self.handle_card_actions(actions);
@@ -3913,6 +4110,7 @@ impl App {
                                         cover,
                                         &entry.album.title,
                                         ui.input(|i| i.time) as f32,
+                                        false,
                                     );
                                     requests.push(ImageSpec {
                                         key: key.clone(),
@@ -3932,16 +4130,10 @@ impl App {
                                     vec2(text_width, 56.0),
                                     Layout::top_down(Align::LEFT),
                                     |ui| {
-                                        let title = elide_text(
-                                            ui.painter(),
-                                            &entry.album.title,
-                                            13.0,
-                                            text_width - 2.0,
-                                        );
                                         if ui
                                             .add(
                                                 egui::Label::new(
-                                                    egui::RichText::new(title)
+                                                    egui::RichText::new(&entry.album.title)
                                                         .size(13.0)
                                                         .strong()
                                                         .color(if missing {
@@ -3950,6 +4142,7 @@ impl App {
                                                             TEXT()
                                                         }),
                                                 )
+                                                .truncate()
                                                 .sense(Sense::click()),
                                             )
                                             .clicked()
@@ -3961,15 +4154,13 @@ impl App {
                                         } else {
                                             entry.album.artist.trim()
                                         };
-                                        ui.label(
-                                            egui::RichText::new(elide_text(
-                                                ui.painter(),
-                                                artist,
-                                                11.0,
-                                                text_width - 2.0,
-                                            ))
-                                            .size(11.0)
-                                            .color(MUTED()),
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(artist)
+                                                    .size(11.0)
+                                                    .color(MUTED()),
+                                            )
+                                            .truncate(),
                                         );
                                         ui.add_space(2.0);
                                         ui.horizontal_wrapped(|ui| {
@@ -4966,6 +5157,40 @@ impl App {
                             }
                         });
                     });
+                    ui.add_space(16.0);
+                    ui.label(
+                        egui::RichText::new("Visual effects")
+                            .size(12.0)
+                            .color(MUTED()),
+                    );
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        for mode in EffectsQuality::ALL {
+                            if theme::chip(
+                                ui,
+                                mode.label(),
+                                self.persisted.settings.effects == mode,
+                            )
+                            .clicked()
+                            {
+                                self.persisted.settings.effects = mode;
+                                changed = true;
+                            }
+                        }
+                    });
+                    ui.add_space(6.0);
+                    if ui
+                        .checkbox(
+                            &mut self.persisted.settings.reduce_motion,
+                            egui::RichText::new("Reduce motion").size(12.5),
+                        )
+                        .on_hover_text(
+                            "Disables shimmer, aurora, the playing equaliser and confetti.",
+                        )
+                        .changed()
+                    {
+                        changed = true;
+                    }
                 });
 
                 ui.add_space(14.0);
@@ -5558,7 +5783,9 @@ impl App {
                 }
             }
         }
-        ctx.request_repaint_after(Duration::from_millis(250));
+        if window_focused(ctx) {
+            ctx.request_repaint_after(Duration::from_millis(250));
+        }
     }
 
     fn draw_confirm_bulk(&mut self, ctx: &egui::Context) {
@@ -5679,6 +5906,7 @@ impl App {
                         rect,
                         &album.title,
                         ui.input(|i| i.time) as f32,
+                        self.motion_enabled(),
                     );
                     ui.label(
                         egui::RichText::new("Loading cover…")
@@ -5846,8 +6074,6 @@ impl App {
                     self.palette_selected = 0;
                 }
             });
-
-        ctx.request_repaint();
     }
 
     /// Execute a command palette action.
@@ -6004,7 +6230,28 @@ impl App {
         if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
             self.show_shortcuts = false;
         }
-        ctx.request_repaint();
+    }
+    fn draw_fps_overlay(&self, ctx: &egui::Context) {
+        egui::Area::new(Id::new("fps-overlay"))
+            .anchor(Align2::RIGHT_TOP, vec2(-10.0, 10.0))
+            .order(egui::Order::Foreground)
+            .interactable(false)
+            .show(ctx, |ui| {
+                Frame::none()
+                    .fill(Color32::from_black_alpha(165))
+                    .rounding(Rounding::same(6.0))
+                    .inner_margin(Margin::symmetric(8.0, 4.0))
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{:.0} FPS · {:.1} ms",
+                                self.fps_value, self.fps_frame_ms
+                            ))
+                            .font(FontId::monospace(10.0))
+                            .color(Color32::from_rgb(170, 240, 190)),
+                        );
+                    });
+            });
     }
 }
 
@@ -6013,6 +6260,17 @@ impl eframe::App for App {
         let now = Instant::now();
         self.anim_dt = (now - self.last_frame).as_secs_f32().clamp(0.0, 0.1);
         self.last_frame = now;
+        if self.fps_enabled {
+            self.fps_frames += 1;
+            let elapsed = self.fps_since.elapsed().as_secs_f32();
+            if elapsed >= 0.5 {
+                self.fps_value = self.fps_frames as f32 / elapsed;
+                self.fps_frame_ms = 1000.0 / self.fps_value.max(0.1);
+                self.fps_frames = 0;
+                self.fps_since = Instant::now();
+                eprintln!("fps: {:.1} ({:.1} ms)", self.fps_value, self.fps_frame_ms);
+            }
+        }
         if let Some(text) = self.pending_clipboard.take() {
             ctx.copy_text(text);
             self.toast("Copied to clipboard.", ToastTone::Success);
@@ -6183,6 +6441,10 @@ impl eframe::App for App {
             || has_active
         {
             ctx.request_repaint_after(Duration::from_millis(180));
+        }
+        if self.fps_enabled {
+            self.draw_fps_overlay(ctx);
+            ctx.request_repaint_after(Duration::from_secs(1));
         }
     }
 
@@ -6853,6 +7115,8 @@ fn draw_grid(
     compact: bool,
     id_salt: &str,
     playing_folder: Option<&Path>,
+    effects: bool,
+    motion: bool,
 ) -> (Vec<CardAction>, bool) {
     let avail = (ui.available_width() - 16.0).max(140.0);
     let min_card = if avail < 560.0 { 140.0 } else { MIN_CARD_WIDTH };
@@ -6875,6 +7139,21 @@ fn draw_grid(
     let total_rows = card_rows + usize::from(has_footer);
     let mut actions: Vec<CardAction> = Vec::new();
     let mut clickable_footer = false;
+
+    // Build membership sets once per frame instead of scanning the watchlist and
+    // library for every visible card. With a large collection this was the most
+    // expensive part of scrolling.
+    let watch_ids: HashSet<u64> = watchlist.iter().map(|album| album.id).collect();
+    let library_ids: HashSet<u64> = library.iter().map(|entry| entry.album.id).collect();
+    let playing_ids: HashSet<u64> = playing_folder
+        .map(|folder| {
+            library
+                .iter()
+                .filter(|entry| entry.folder() == folder)
+                .map(|entry| entry.album.id)
+                .collect()
+        })
+        .unwrap_or_default();
 
     let output = ScrollArea::vertical()
         .id_salt(id_salt)
@@ -6910,14 +7189,9 @@ fn draw_grid(
                             break;
                         }
                         let album = &albums[index];
-                        let watched = watchlist.iter().any(|a| a.id == album.id);
-                        let downloaded = library.iter().any(|e| e.album.id == album.id);
-                        let playing = downloaded
-                            && playing_folder.is_some_and(|folder| {
-                                library
-                                    .iter()
-                                    .any(|e| e.album.id == album.id && e.folder() == folder)
-                            });
+                        let watched = watch_ids.contains(&album.id);
+                        let downloaded = library_ids.contains(&album.id);
+                        let playing = playing_ids.contains(&album.id);
                         let current_folder = watch_meta
                             .get(&album.id)
                             .and_then(|meta| meta.folder.as_deref());
@@ -6935,6 +7209,8 @@ fn draw_grid(
                             requests,
                             show_new,
                             compact,
+                            effects,
+                            motion,
                         ) {
                             actions.push(action);
                         }
@@ -6966,16 +7242,39 @@ fn draw_card(
     requests: &mut Vec<ImageSpec>,
     show_new: bool,
     compact: bool,
+    effects: bool,
+    motion: bool,
 ) -> Option<CardAction> {
-    let (rect, response) =
+    let (card_rect, response) =
         ui.allocate_exact_size(vec2(layout.card_width, layout.card_height), Sense::click());
     // The action buttons only exist while the card is hovered. Using the response alone
     // makes them vanish as soon as the pointer is over a button, which causes flicker.
-    let hovered = response.hovered() || ui.rect_contains_pointer(rect);
+    let hovered = response.hovered() || ui.rect_contains_pointer(card_rect);
     let hover_t = ui
         .ctx()
         .animate_bool_with_time(Id::new(("card-hover", album.id)), hovered, 0.13);
+    // Visual lift: only the painting moves, the interaction rect stays put so the
+    // hover state cannot flicker at the card edge.
+    let lift = if motion { hover_t * 2.0 } else { 0.0 };
+    let rect = card_rect.translate(vec2(0.0, -lift));
     let painter = ui.painter().clone();
+    let key = format!("t{}", album.id);
+    let tint = textures.tint(&key);
+
+    // Ambient glow tinted by the cover colour, painted behind the card.
+    if effects && (selected || hover_t > 0.01) {
+        if let Some(tint) = tint {
+            let strength = if selected { 0.30 } else { 0.20 * hover_t };
+            paint_soft_glow(
+                &painter,
+                rect.center(),
+                vec2(rect.width() * 0.72, rect.height() * 0.60),
+                tint,
+                strength,
+            );
+        }
+    }
+
     let bg = if selected {
         Color32::from_rgb(25, 24, 38)
     } else {
@@ -7003,16 +7302,52 @@ fn draw_card(
         rect.min + vec2(8.0, 8.0),
         vec2(rect.width() - 16.0, rect.width() - 16.0),
     );
-    let key = format!("t{}", album.id);
     let mut action = None;
 
+    // Pointer parallax inside the cover (full effects only).
+    let parallax = if motion && hover_t > 0.01 {
+        ui.input(|i| i.pointer.hover_pos())
+            .map(|pos| {
+                let rel =
+                    (pos - cover.center()) / vec2(cover.width().max(1.0), cover.height().max(1.0));
+                vec2(rel.x.clamp(-0.5, 0.5), rel.y.clamp(-0.5, 0.5)) * (2.0 * hover_t)
+            })
+            .unwrap_or(Vec2::ZERO)
+    } else {
+        Vec2::ZERO
+    };
+
     if let Some((texture, alpha)) = textures.get_with_fade(&key) {
-        paint_texture_cover(&painter, cover, texture, Rounding::same(9.0), alpha);
+        paint_texture_cover_fx(
+            &painter,
+            cover,
+            texture,
+            Rounding::same(9.0),
+            alpha,
+            parallax,
+            if motion { 1.0 + 0.06 * hover_t } else { 1.0 },
+        );
         if alpha < 1.0 {
             ui.ctx().request_repaint();
         }
+    } else if textures.is_failed(&key) {
+        // A failed image never retries, so draw a static placeholder and stop
+        // requesting repaints. This used to spin the whole app at ~12 FPS.
+        paint_cover_placeholder(
+            &painter,
+            cover,
+            &album.title,
+            ui.input(|i| i.time) as f32,
+            false,
+        );
     } else {
-        paint_cover_placeholder(&painter, cover, &album.title, ui.input(|i| i.time) as f32);
+        paint_cover_placeholder(
+            &painter,
+            cover,
+            &album.title,
+            ui.input(|i| i.time) as f32,
+            motion,
+        );
         ui.ctx().request_repaint_after(Duration::from_millis(80));
         requests.push(ImageSpec {
             key: key.clone(),
@@ -7020,6 +7355,11 @@ fn draw_card(
             cache_path: store::thumb_cache_path(album.id),
             max_dim: 288,
         });
+    }
+
+    // Diagonal light sweep across the cover on hover.
+    if motion && hover_t > 0.01 {
+        paint_light_sweep(&painter, cover, hover_t);
     }
 
     // Subtle hover shade over the image.
@@ -7206,7 +7546,11 @@ fn draw_card(
         painter.rect_filled(eq_rect, Rounding::same(6.0), Color32::from_black_alpha(165));
         let time = ui.input(|i| i.time) as f32;
         for bar in 0..3 {
-            let level = (time * 5.2 + bar as f32 * 1.9).sin() * 0.5 + 0.5;
+            let level = if motion {
+                (time * 5.2 + bar as f32 * 1.9).sin() * 0.5 + 0.5
+            } else {
+                0.7
+            };
             let height = 5.0 + level * 9.0;
             let x = eq_rect.left() + 9.0 + bar as f32 * 8.0;
             painter.rect_filled(
@@ -7218,7 +7562,9 @@ fn draw_card(
                 accent(),
             );
         }
-        ui.ctx().request_repaint_after(Duration::from_millis(90));
+        if motion && window_focused(ui.ctx()) {
+            ui.ctx().request_repaint_after(Duration::from_millis(90));
+        }
     }
 
     if show_new && album.is_new {
@@ -7289,14 +7635,8 @@ fn draw_card(
         } else {
             album.artist.trim()
         };
-        let artist_text = elide_text(&painter, artist, 10.8, text_width);
-        painter.text(
-            pos2(text_left, cover.bottom() + 43.0),
-            Align2::LEFT_TOP,
-            artist_text,
-            FontId::proportional(10.8),
-            MUTED(),
-        );
+        let artist_text = elided_galley(&painter, artist, 10.8, MUTED(), text_width);
+        painter.galley(pos2(text_left, cover.bottom() + 43.0), artist_text, MUTED());
     }
 
     response.context_menu(|ui| {
@@ -7404,28 +7744,30 @@ fn draw_card(
     action
 }
 
-fn elide_text(painter: &egui::Painter, text: &str, size: f32, max_width: f32) -> String {
-    let full = painter.layout_no_wrap(text.to_string(), FontId::proportional(size), MUTED());
-    if full.size().x <= max_width {
-        return text.to_string();
-    }
-    let chars: Vec<char> = text.chars().collect();
-    let mut low = 0usize;
-    let mut high = chars.len();
-    while low < high {
-        let mid = (low + high + 1) / 2;
-        let candidate: String = chars[..mid].iter().collect::<String>() + "…";
-        let width = painter
-            .layout_no_wrap(candidate.clone(), FontId::proportional(size), MUTED())
-            .size()
-            .x;
-        if width <= max_width {
-            low = mid;
-        } else {
-            high = mid - 1;
-        }
-    }
-    chars[..low].iter().collect::<String>() + "…"
+/// Lay out a single line of text, truncating it with `…` in one pass.
+///
+/// The old implementation binary-searched the string and re-laid it out up to
+/// ten times per call, which was measurable in the player bar every frame.
+fn elided_galley(
+    painter: &egui::Painter,
+    text: &str,
+    size: f32,
+    color: Color32,
+    max_width: f32,
+) -> std::sync::Arc<egui::Galley> {
+    let mut job = egui::text::LayoutJob::single_section(
+        text.to_owned(),
+        egui::TextFormat {
+            font_id: FontId::proportional(size),
+            color,
+            ..Default::default()
+        },
+    );
+    job.wrap.max_width = max_width;
+    job.wrap.max_rows = 1;
+    job.wrap.break_anywhere = true;
+    job.wrap.overflow_character = Some('…');
+    painter.layout_job(job)
 }
 
 fn paint_texture_cover(
@@ -7434,6 +7776,19 @@ fn paint_texture_cover(
     texture: &egui::TextureHandle,
     rounding: Rounding,
     alpha: f32,
+) {
+    paint_texture_cover_fx(painter, rect, texture, rounding, alpha, Vec2::ZERO, 1.0);
+}
+
+/// Draw a cover with an optional UV zoom/shift, used for the card hover parallax.
+fn paint_texture_cover_fx(
+    painter: &egui::Painter,
+    rect: Rect,
+    texture: &egui::TextureHandle,
+    rounding: Rounding,
+    alpha: f32,
+    offset: Vec2,
+    zoom: f32,
 ) {
     let tex_size = texture.size_vec2();
     if tex_size.x <= 0.0 || tex_size.y <= 0.0 {
@@ -7454,6 +7809,14 @@ fn paint_texture_cover(
             pos2(1.0, (1.0 + visible) * 0.5),
         )
     };
+    let uv = if zoom > 1.0 {
+        let center = uv.center();
+        let half = uv.size() * 0.5 / zoom;
+        let shift = vec2(offset.x * half.x * 0.20, offset.y * half.y * 0.20);
+        Rect::from_center_size(center + shift, half * 2.0)
+    } else {
+        uv
+    };
     let mut shape = egui::epaint::RectShape::filled(
         rect,
         rounding,
@@ -7464,18 +7827,27 @@ fn paint_texture_cover(
     painter.add(shape);
 }
 
-fn paint_cover_placeholder(painter: &egui::Painter, rect: Rect, title: &str, time: f32) {
+fn paint_cover_placeholder(
+    painter: &egui::Painter,
+    rect: Rect,
+    title: &str,
+    time: f32,
+    shimmer: bool,
+) {
     painter.rect_filled(rect, Rounding::same(9.0), Color32::from_rgb(25, 26, 37));
     // Cheap animated shimmer band: no textures, no allocation beyond a rect.
-    let phase = (time * 0.45).fract();
-    let band_width = rect.width() * 0.34;
-    let band_x = rect.left() - band_width + phase * (rect.width() + band_width * 2.0);
-    let band = Rect::from_min_size(pos2(band_x, rect.top()), vec2(band_width, rect.height()));
-    painter.with_clip_rect(rect).rect_filled(
-        band,
-        Rounding::same(9.0),
-        Color32::from_white_alpha(13),
-    );
+    // Failed downloads use a static placeholder so they never request repaints.
+    if shimmer {
+        let phase = (time * 0.45).fract();
+        let band_width = rect.width() * 0.34;
+        let band_x = rect.left() - band_width + phase * (rect.width() + band_width * 2.0);
+        let band = Rect::from_min_size(pos2(band_x, rect.top()), vec2(band_width, rect.height()));
+        painter.with_clip_rect(rect).rect_filled(
+            band,
+            Rounding::same(9.0),
+            Color32::from_white_alpha(13),
+        );
+    }
     let stripe = Rect::from_min_size(rect.left_top(), vec2(rect.width(), 2.0));
     painter.rect_filled(stripe, Rounding::same(1.0), accent_dim(80));
     let initial = title
@@ -7828,6 +8200,8 @@ fn draw_detail(
     watch_meta: Option<&mut WatchMeta>,
     playable: Option<(PathBuf, PathBuf)>,
     requests: &mut Vec<ImageSpec>,
+    effects: bool,
+    motion: bool,
 ) -> Vec<DetailAction> {
     let mut actions = Vec::new();
     ui.horizontal(|ui| {
@@ -7858,6 +8232,20 @@ fn draw_detail(
     let watched = watchlist.iter().any(|a| a.id == album.id);
     let cover_key = format!("c{}", album.id);
 
+    // Ambient glow tinted by the loaded cover colour, behind the panel content.
+    if effects {
+        if let Some(tint) = textures.tint(&cover_key) {
+            let panel = ui.max_rect();
+            paint_soft_glow(
+                ui.painter(),
+                pos2(panel.center().x, panel.top() + panel.width() * 0.42),
+                vec2(panel.width() * 0.95, panel.width() * 0.72),
+                tint,
+                0.18,
+            );
+        }
+    }
+
     ScrollArea::vertical()
         .id_salt("detail-scroll")
         .auto_shrink([false, false])
@@ -7884,12 +8272,21 @@ fn draw_detail(
                 if alpha < 1.0 {
                     ui.ctx().request_repaint();
                 }
+            } else if textures.is_failed(&cover_key) {
+                paint_cover_placeholder(
+                    ui.painter(),
+                    cover_rect,
+                    &album.title,
+                    ui.input(|i| i.time) as f32,
+                    false,
+                );
             } else {
                 paint_cover_placeholder(
                     ui.painter(),
                     cover_rect,
                     &album.title,
                     ui.input(|i| i.time) as f32,
+                    motion,
                 );
                 ui.ctx().request_repaint_after(Duration::from_millis(80));
                 requests.push(ImageSpec {

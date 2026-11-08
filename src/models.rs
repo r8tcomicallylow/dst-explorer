@@ -371,6 +371,35 @@ pub struct Settings {
     pub last_track_folder: Option<PathBuf>,
     pub last_track_path: Option<PathBuf>,
     pub last_track_position: f32,
+    /// How much visual decoration to draw (ambient glow, aurora, hover effects).
+    pub effects: EffectsQuality,
+    /// Disable non-essential animation (shimmer, aurora, equalizer, confetti).
+    pub reduce_motion: bool,
+}
+
+/// Visual effects level. `Off` keeps the UI completely static.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EffectsQuality {
+    /// No ambient glow, aurora, shimmer or hover animation.
+    Off,
+    /// Ambient glow and hover feedback, but no animated background.
+    Soft,
+    /// Everything, including the animated aurora background.
+    #[default]
+    Full,
+}
+
+impl EffectsQuality {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::Soft => "Soft",
+            Self::Full => "Full",
+        }
+    }
+
+    pub const ALL: [Self; 3] = [Self::Full, Self::Soft, Self::Off];
 }
 
 impl Default for Settings {
@@ -420,6 +449,8 @@ impl Default for Settings {
             last_track_folder: None,
             last_track_path: None,
             last_track_position: 0.0,
+            effects: EffectsQuality::Full,
+            reduce_motion: false,
         }
     }
 }
@@ -1067,5 +1098,16 @@ mod tests {
         assert!(state.remove_save_rule(0));
         assert!(state.save_rules.is_empty());
         assert!(!state.remove_save_rule(0));
+    }
+
+    #[test]
+    fn old_settings_default_to_full_effects() {
+        let settings: Settings = serde_json::from_str("{}").expect("empty settings");
+        assert_eq!(settings.effects, EffectsQuality::Full);
+        assert!(!settings.reduce_motion);
+
+        let json = serde_json::to_string(&settings).expect("serialize");
+        assert!(json.contains("\"effects\":\"full\""));
+        assert!(json.contains("\"reduce_motion\":false"));
     }
 }

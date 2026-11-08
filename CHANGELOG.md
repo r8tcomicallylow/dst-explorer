@@ -4,7 +4,15 @@ All notable changes to this project will be documented in this format.
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-11-08
+
 ### Added
+- Dominant-colour ambient glow behind the detail panel, player bar and highlighted cards
+- Card hover lift, diagonal light sweep and subtle cover parallax
+- Frosted-glass styling for the detail panel, player bar and selection bar
+- Animated aurora background on empty Discover / Search states
+- "Visual effects" level (Full / Soft / Off) and a "Reduce motion" setting
+- `DST_FPS=1` frame-pacing overlay (FPS and frame time)
 - Download queue prioritization (`First`, `↑`, `↓`) and per-host pause/resume chips
 - Resume interrupted downloads automatically on launch (`.part` + HTTP Range)
 - Global download speed limit, optional scheduler window and source archive auto-delete
@@ -37,12 +45,18 @@ All notable changes to this project will be documented in this format.
   card hover states, cover fade-in, shimmer placeholders and toast fade-out
 
 ### Changed
+- Render optimisations: watchlist/library membership is indexed once per frame instead of
+  scanned per card, text elision is a single layout pass, texture trimming tracks bytes
+  incrementally, and image requests are skipped when a key is already known
 - Player queue handling now resets prefetch state correctly when shuffle, repeat or resume changes
 - Lower memory footprint: photo cache now has a 20 MB byte cap in addition to the entry limit,
   thumbnails and covers decode at smaller sizes, image workers share one HTTP client,
   and locale bundles are parsed lazily instead of all five at startup
 
 ### Fixed
+- A failed cover download no longer triggers a permanent ~12 FPS repaint loop with an endlessly
+  animated shimmer placeholder
+- Command palette and shortcut overlay no longer force a full repaint every frame
 - UI scale slider no longer jumps back and forth; zoom is applied when the drag ends
 - Waveform scrubbing previews the position while dragging and seeks once on release
 - Seeking after a gapless track transition now uses the correct offset inside the sink
