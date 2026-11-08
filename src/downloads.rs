@@ -337,10 +337,13 @@ impl DownloadManager {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// Apply the current settings. This is called every frame, so it only
+    /// touches the copies/atomics that actually changed and only re-dispatches
+    /// when something did. `poll()` already dispatches finished slots.
     pub fn configure(
         &mut self,
         max_concurrent: usize,
-        download_dir: PathBuf,
+        download_dir: &Path,
         auto_extract: bool,
         auto_retry: bool,
         max_retries: usize,
@@ -350,18 +353,52 @@ impl DownloadManager {
         schedule_start_hour: u8,
         schedule_end_hour: u8,
     ) {
-        self.max_concurrent = max_concurrent.max(1);
-        self.download_dir = download_dir;
-        self.auto_extract = auto_extract;
-        self.auto_retry = auto_retry;
-        self.max_retries = max_retries;
-        self.delete_source_after_extract = delete_source_after_extract;
-        self.speed_limit
-            .store(u64::from(speed_limit_kbps) * 1024, Ordering::Relaxed);
-        self.scheduler_enabled = scheduler_enabled;
-        self.schedule_start_hour = schedule_start_hour;
-        self.schedule_end_hour = schedule_end_hour;
-        self.dispatch();
+        let max_concurrent = max_concurrent.max(1);
+        let speed_limit = u64::from(speed_limit_kbps) * 1024;
+        let mut changed = false;
+        if self.max_concurrent != max_concurrent {
+            self.max_concurrent = max_concurrent;
+            changed = true;
+        }
+        if self.download_dir != download_dir {
+            self.download_dir = download_dir.to_path_buf();
+            changed = true;
+        }
+        if self.auto_extract != auto_extract {
+            self.auto_extract = auto_extract;
+            changed = true;
+        }
+        if self.auto_retry != auto_retry {
+            self.auto_retry = auto_retry;
+            changed = true;
+        }
+        if self.max_retries != max_retries {
+            self.max_retries = max_retries;
+            changed = true;
+        }
+        if self.delete_source_after_extract != delete_source_after_extract {
+            self.delete_source_after_extract = delete_source_after_extract;
+            changed = true;
+        }
+        if self.speed_limit.load(Ordering::Relaxed) != speed_limit {
+            self.speed_limit.store(speed_limit, Ordering::Relaxed);
+            changed = true;
+        }
+        if self.scheduler_enabled != scheduler_enabled {
+            self.scheduler_enabled = scheduler_enabled;
+            changed = true;
+        }
+        if self.schedule_start_hour != schedule_start_hour {
+            self.schedule_start_hour = schedule_start_hour;
+            changed = true;
+        }
+        if self.schedule_end_hour != schedule_end_hour {
+            self.schedule_end_hour = schedule_end_hour;
+            changed = true;
+        }
+        if changed {
+            self.dispatch();
+        }
     }
 
     /// Whether new downloads are currently allowed by the scheduler.

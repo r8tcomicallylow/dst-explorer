@@ -481,8 +481,43 @@ enum ToastTone {
 struct DownloadUiState {
     speeds: HashMap<u64, (u64, Instant, f32)>,
     cache_bytes: u64,
+    /// Formatted `cache_bytes`, recomputed only when the size changes.
+    cache_text: String,
     cache_checked: Instant,
     manual_opened: HashSet<u64>,
+}
+
+/// Cached library filter/sort result. Rebuilt only when the library or the
+/// filter controls change, so scrolling a large collection does not re-filter
+/// and re-sort every frame.
+struct LibraryViewCache {
+    initialized: bool,
+    rev: u64,
+    query: String,
+    format: Option<String>,
+    year: Option<u16>,
+    sort: LibrarySort,
+    visible: Vec<usize>,
+    formats: Vec<String>,
+    years: Vec<u16>,
+    total_bytes: u64,
+}
+
+impl Default for LibraryViewCache {
+    fn default() -> Self {
+        Self {
+            initialized: false,
+            rev: 0,
+            query: String::new(),
+            format: None,
+            year: None,
+            sort: LibrarySort::Newest,
+            visible: Vec::new(),
+            formats: Vec::new(),
+            years: Vec::new(),
+            total_bytes: 0,
+        }
+    }
 }
 
 /// Command palette action
@@ -540,6 +575,8 @@ pub struct App {
     library_query: String,
     library_format_filter: Option<String>,
     library_year_filter: Option<u16>,
+    library_rev: u64,
+    library_view: LibraryViewCache,
     search_regex: bool,
     search_quality: QualityFilter,
     search_availability: AvailabilityFilter,
@@ -625,6 +662,7 @@ impl App {
             settings.auto_retry,
             settings.max_retries,
         );
+        let cache_bytes = store::cache_size();
         let player = AudioPlayer::new(settings.audio_enabled, settings.audio_volume);
         let mut app = Self {
             persisted,
@@ -647,7 +685,8 @@ impl App {
             downloads,
             dl_ui: DownloadUiState {
                 speeds: HashMap::new(),
-                cache_bytes: store::cache_size(),
+                cache_bytes,
+                cache_text: store::human_size(cache_bytes),
                 cache_checked: Instant::now(),
                 manual_opened: HashSet::new(),
             },
@@ -667,6 +706,8 @@ impl App {
             library_query: String::new(),
             library_format_filter: None,
             library_year_filter: None,
+            library_rev: 0,
+            library_view: LibraryViewCache::default(),
             search_regex: false,
             search_quality: QualityFilter::Any,
             search_availability: AvailabilityFilter::Any,
@@ -1804,6 +1845,7 @@ impl App {
                                 library.clone(),
                             ) {
                                 self.persisted.library = l;
+                                self.library_rev = self.library_rev.wrapping_add(1);
                                 imported_something = true;
                             }
                         }
@@ -1877,6 +1919,7 @@ impl App {
             }
         }
         if changed {
+            self.library_rev = self.library_rev.wrapping_add(1);
             self.dirty = true;
         }
     }
@@ -1935,11 +1978,15 @@ impl App {
         }
     }
 
-    fn watch_albums(&self) -> Vec<Album> {
+    /// Indices of the watchlist entries matching the current folder filter.
+    /// Indices avoid cloning albums on every frame; the grid looks them up in
+    /// the original watchlist.
+    fn watch_indices(&self) -> Vec<usize> {
         self.persisted
             .watchlist
             .iter()
-            .filter(|album| match &self.watch_filter {
+            .enumerate()
+            .filter(|(_, album)| match &self.watch_filter {
                 WatchFilter::All => true,
                 WatchFilter::Uncategorized => self
                     .persisted
@@ -1950,7 +1997,14 @@ impl App {
                     self.persisted.watch_folder_of(album.id) == Some(name.as_str())
                 }
             })
-            .cloned()
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    fn watch_albums(&self) -> Vec<Album> {
+        self.watch_indices()
+            .into_iter()
+            .map(|index| self.persisted.watchlist[index].clone())
             .collect()
     }
 
@@ -2008,6 +2062,82 @@ impl App {
         years.dedup();
         years.reverse(); // newest first
         years
+    }
+
+    /// Rebuild the cached library filter/sort when the library or one of the
+    /// filter controls changes. The expensive part (lowercasing titles,
+    /// comparing and sorting) then runs once instead of on every repaint.
+    fn ensure_library_view(&mut self) {
+        let sort = self.persisted.settings.library_sort;
+        {
+            let cache = &self.library_view;
+            if cache.initialized
+                && cache.rev == self.library_rev
+                && cache.query == self.library_query
+                && cache.format == self.library_format_filter
+                && cache.year == self.library_year_filter
+                && cache.sort == sort
+            {
+                return;
+            }
+        }
+
+        let query = self.library_query.trim().to_lowercase();
+        let format_filter = self.library_format_filter.as_deref();
+        let year_filter = self.library_year_filter;
+        let library = &self.persisted.library;
+        let mut visible: Vec<usize> = library
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| {
+                let matches_query = query.is_empty()
+                    || entry.album.title.to_lowercase().contains(&query)
+                    || entry.album.artist.to_lowercase().contains(&query)
+                    || entry.path.to_string_lossy().to_lowercase().contains(&query);
+
+                let matches_format = format_filter
+                    .map_or(true, |f| entry.album.format.trim().eq_ignore_ascii_case(f));
+
+                let matches_year = year_filter.map_or(true, |y| entry.album.year == y);
+
+                matches_query && matches_format && matches_year
+            })
+            .map(|(index, _)| index)
+            .collect();
+
+        // Decorate once instead of lowercasing inside the comparator.
+        match sort {
+            LibrarySort::Title => {
+                visible.sort_by_cached_key(|&index| library[index].album.title.to_lowercase());
+            }
+            LibrarySort::Artist => {
+                visible.sort_by_cached_key(|&index| library[index].album.artist.to_lowercase());
+            }
+            LibrarySort::Format => {
+                visible.sort_by_cached_key(|&index| library[index].album.format.to_lowercase());
+            }
+            LibrarySort::Size => {
+                visible.sort_by_cached_key(|&index| std::cmp::Reverse(library[index].size));
+            }
+            LibrarySort::Newest => {
+                visible.sort_by_cached_key(|&index| std::cmp::Reverse(library[index].completed_at));
+            }
+        }
+
+        let total_bytes = library.iter().map(|entry| entry.size).sum();
+        let formats = self.get_library_formats();
+        let years = self.get_library_years();
+        let cache = &mut self.library_view;
+        cache.initialized = true;
+        cache.rev = self.library_rev;
+        cache.query.clone_from(&self.library_query);
+        cache.format.clone_from(&self.library_format_filter);
+        cache.year = self.library_year_filter;
+        cache.sort = sort;
+        cache.visible = visible;
+        cache.formats = formats;
+        cache.years = years;
+        cache.total_bytes = total_bytes;
     }
 
     fn find_album(&self, id: u64) -> Option<Album> {
@@ -2246,7 +2376,7 @@ impl App {
 
     fn draw_sidebar(&mut self, ctx: &egui::Context) {
         let mut navigate = None;
-        let cache_text = store::human_size(self.dl_ui.cache_bytes);
+        let cache_text = self.dl_ui.cache_text.clone();
         let active = self.downloads.active_count();
         let compact = ctx.screen_rect().width() < 960.0;
         let target = if self.persisted.settings.sidebar_collapsed || compact {
@@ -3018,6 +3148,7 @@ impl App {
         let (actions, near_bottom) = draw_grid(
             ui,
             &self.latest,
+            None,
             &mut self.textures,
             &self.selection,
             &self.persisted.watchlist,
@@ -3028,7 +3159,7 @@ impl App {
             self.persisted.settings.show_new_badges,
             footer,
             self.persisted.settings.compact_grid,
-            &format!("latest-{}", self.latest_gen),
+            ("latest", self.latest_gen),
             self.player.queue_folder(),
             effects,
             motion,
@@ -3527,6 +3658,7 @@ impl App {
         let (actions, near_bottom) = draw_grid(
             ui,
             &self.search.display,
+            None,
             &mut self.textures,
             &self.selection,
             &self.persisted.watchlist,
@@ -3537,7 +3669,7 @@ impl App {
             false,
             footer,
             self.persisted.settings.compact_grid,
-            &format!("search-{}", self.search.gen),
+            ("search", self.search.gen),
             self.player.queue_folder(),
             effects,
             motion,
@@ -3553,7 +3685,8 @@ impl App {
 
     fn view_watchlist(&mut self, ui: &mut Ui) {
         let total = self.persisted.watchlist.len();
-        let visible = self.watch_albums();
+        let indices = self.watch_indices();
+        let shown = indices.len();
         let note_count = self
             .persisted
             .watchlist
@@ -3563,10 +3696,10 @@ impl App {
         let subtitle = if total == 0 {
             self.t("watchlist-empty")
         } else {
-            let mut text = if visible.len() == total {
+            let mut text = if shown == total {
                 format!("{total} {}", self.t("albums-word"))
             } else {
-                format!("{} / {total} {}", visible.len(), self.t("albums-word"))
+                format!("{shown} / {total} {}", self.t("albums-word"))
             };
             if note_count > 0 {
                 text.push_str(&format!(" · {note_count} ✎"));
@@ -3574,32 +3707,21 @@ impl App {
             text
         };
         let mut add_folder = false;
-        let download_albums = visible.clone();
+        let mut download_shown = false;
         view_header(
             ui,
             self.t("collection"),
             self.t("watchlist-title"),
             subtitle,
             |ui| {
-                if !download_albums.is_empty() {
-                    let label = if download_albums.len() == total {
+                if shown > 0 {
+                    let label = if shown == total {
                         "Download all"
                     } else {
                         "Download shown"
                     };
                     if theme::secondary_button(ui, label).clicked() {
-                        let count = download_albums.len();
-                        for album in &download_albums {
-                            self.downloads.enqueue(album.clone());
-                        }
-                        self.toast(
-                            format!(
-                                "Queued {count} download{}",
-                                if count == 1 { "" } else { "s" }
-                            ),
-                            ToastTone::Success,
-                        );
-                        self.view = View::Downloads;
+                        download_shown = true;
                     }
                 }
                 if theme::secondary_button(ui, "New folder").clicked() {
@@ -3607,38 +3729,72 @@ impl App {
                 }
             },
         );
+        if download_shown {
+            let albums: Vec<Album> = indices
+                .iter()
+                .map(|&index| self.persisted.watchlist[index].clone())
+                .collect();
+            let count = albums.len();
+            for album in albums {
+                self.downloads.enqueue(album);
+            }
+            self.toast(
+                format!(
+                    "Queued {count} download{}",
+                    if count == 1 { "" } else { "s" }
+                ),
+                ToastTone::Success,
+            );
+            self.view = View::Downloads;
+        }
         if add_folder {
             self.folder_draft = Some(String::new());
         }
         ui.add_space(10.0);
 
-        let folders = self.persisted.watch_folders.clone();
-        ui.horizontal_wrapped(|ui| {
-            ui.label(
-                egui::RichText::new("FOLDERS")
-                    .size(9.5)
-                    .strong()
-                    .color(DIM()),
-            );
-            if theme::chip(ui, "All", self.watch_filter == WatchFilter::All).clicked() {
-                self.set_watch_filter(WatchFilter::All);
-            }
-            if theme::chip(
-                ui,
-                "Uncategorized",
-                self.watch_filter == WatchFilter::Uncategorized,
-            )
-            .clicked()
-            {
-                self.set_watch_filter(WatchFilter::Uncategorized);
-            }
-            for folder in &folders {
-                let selected = self.watch_filter == WatchFilter::Folder(folder.clone());
-                if theme::chip(ui, folder, selected).clicked() {
-                    self.set_watch_filter(WatchFilter::Folder(folder.clone()));
+        let mut select_all = false;
+        let mut select_uncategorized = false;
+        let mut select_folder: Option<usize> = None;
+        {
+            let folders = &self.persisted.watch_folders;
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    egui::RichText::new("FOLDERS")
+                        .size(9.5)
+                        .strong()
+                        .color(DIM()),
+                );
+                if theme::chip(ui, "All", self.watch_filter == WatchFilter::All).clicked() {
+                    select_all = true;
                 }
-            }
-        });
+                if theme::chip(
+                    ui,
+                    "Uncategorized",
+                    self.watch_filter == WatchFilter::Uncategorized,
+                )
+                .clicked()
+                {
+                    select_uncategorized = true;
+                }
+                for (index, folder) in folders.iter().enumerate() {
+                    let selected = matches!(
+                        &self.watch_filter,
+                        WatchFilter::Folder(name) if name == folder
+                    );
+                    if theme::chip(ui, folder, selected).clicked() {
+                        select_folder = Some(index);
+                    }
+                }
+            });
+        }
+        if select_all {
+            self.set_watch_filter(WatchFilter::All);
+        } else if select_uncategorized {
+            self.set_watch_filter(WatchFilter::Uncategorized);
+        } else if let Some(index) = select_folder {
+            let name = self.persisted.watch_folders[index].clone();
+            self.set_watch_filter(WatchFilter::Folder(name));
+        }
 
         if let WatchFilter::Folder(name) = self.watch_filter.clone() {
             ui.horizontal_wrapped(|ui| {
@@ -3788,7 +3944,7 @@ impl App {
             return;
         }
 
-        if visible.is_empty() {
+        if shown == 0 {
             draw_empty(
                 ui,
                 Icon::Folder,
@@ -3805,7 +3961,8 @@ impl App {
         let motion = self.motion_enabled();
         let (actions, _) = draw_grid(
             ui,
-            &visible,
+            &self.persisted.watchlist,
+            Some(indices.as_slice()),
             &mut self.textures,
             &self.selection,
             &self.persisted.watchlist,
@@ -3826,8 +3983,9 @@ impl App {
     }
 
     fn view_library(&mut self, ui: &mut Ui) {
+        self.ensure_library_view();
         let count = self.persisted.library.len();
-        let total: u64 = self.persisted.library.iter().map(|entry| entry.size).sum();
+        let total = self.library_view.total_bytes;
         let subtitle = format!(
             "{} {} · {}",
             count,
@@ -3902,7 +4060,7 @@ impl App {
         // Filter toolbar
         ui.horizontal(|ui| {
             // Format filter
-            let formats = self.get_library_formats();
+            let formats = &self.library_view.formats;
             let format_label = self
                 .library_format_filter
                 .as_ref()
@@ -3913,7 +4071,7 @@ impl App {
                 .width(140.0)
                 .show_ui(ui, |ui| {
                     ui.selectable_value(&mut self.library_format_filter, None, "All formats");
-                    for fmt in &formats {
+                    for fmt in formats {
                         ui.selectable_value(
                             &mut self.library_format_filter,
                             Some(fmt.clone()),
@@ -3925,7 +4083,7 @@ impl App {
             ui.add_space(8.0);
 
             // Year filter
-            let years = self.get_library_years();
+            let years = &self.library_view.years;
             let year_label = self
                 .library_year_filter
                 .map(|y| y.to_string())
@@ -3935,7 +4093,7 @@ impl App {
                 .width(110.0)
                 .show_ui(ui, |ui| {
                     ui.selectable_value(&mut self.library_year_filter, None, "All years");
-                    for year in &years {
+                    for year in years {
                         ui.selectable_value(
                             &mut self.library_year_filter,
                             Some(*year),
@@ -4009,57 +4167,7 @@ impl App {
             return;
         }
 
-        let query = self.library_query.trim().to_lowercase();
-        let format_filter = &self.library_format_filter;
-        let year_filter = self.library_year_filter;
-        let mut visible: Vec<usize> = self
-            .persisted
-            .library
-            .iter()
-            .enumerate()
-            .filter(|(_, entry)| {
-                let matches_query = query.is_empty()
-                    || entry.album.title.to_lowercase().contains(&query)
-                    || entry.album.artist.to_lowercase().contains(&query)
-                    || entry.path.to_string_lossy().to_lowercase().contains(&query);
-
-                let matches_format = format_filter
-                    .as_ref()
-                    .map_or(true, |f| entry.album.format.trim().eq_ignore_ascii_case(f));
-
-                let matches_year = year_filter.map_or(true, |y| entry.album.year == y);
-
-                matches_query && matches_format && matches_year
-            })
-            .map(|(index, _)| index)
-            .collect();
-
-        let sort = self.persisted.settings.library_sort;
-        let library = &self.persisted.library;
-        visible.sort_by(|a, b| {
-            let left = &library[*a];
-            let right = &library[*b];
-            match sort {
-                LibrarySort::Title => left
-                    .album
-                    .title
-                    .to_lowercase()
-                    .cmp(&right.album.title.to_lowercase()),
-                LibrarySort::Artist => left
-                    .album
-                    .artist
-                    .to_lowercase()
-                    .cmp(&right.album.artist.to_lowercase()),
-                LibrarySort::Format => left
-                    .album
-                    .format
-                    .to_lowercase()
-                    .cmp(&right.album.format.to_lowercase()),
-                LibrarySort::Size => right.size.cmp(&left.size),
-                LibrarySort::Newest => right.completed_at.cmp(&left.completed_at),
-            }
-        });
-
+        let visible = &self.library_view.visible;
         if visible.is_empty() {
             draw_empty(
                 ui,
@@ -4080,7 +4188,7 @@ impl App {
             .id_salt("library-list")
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                for index in visible {
+                for &index in visible {
                     let entry = &persisted.library[index];
                     let missing = entry.missing();
                     let response = Frame::none()
@@ -4297,6 +4405,7 @@ impl App {
                     self.persisted
                         .library
                         .retain(|entry| entry.album.id != album_id);
+                    self.library_rev = self.library_rev.wrapping_add(1);
                     self.downloads.forget_done_album(album_id);
                     self.dirty = true;
                     match removed {
@@ -5335,7 +5444,8 @@ impl App {
 
                 ui.add_space(14.0);
                 settings_card(ui, self.t("storage"), |ui| {
-                    self.dl_ui.cache_bytes = store::cache_size();
+                    // The size is refreshed in `update()` every 20 seconds; do not
+                    // walk the cache directory on every frame.
                     ui.horizontal(|ui| {
                         ui.vertical(|ui| {
                             ui.label(
@@ -5347,7 +5457,7 @@ impl App {
                             ui.label(
                                 egui::RichText::new(format!(
                                     "{} {}",
-                                    store::human_size(self.dl_ui.cache_bytes),
+                                    self.dl_ui.cache_text,
                                     self.t("stored-on-disk")
                                 ))
                                 .size(11.5)
@@ -5361,6 +5471,7 @@ impl App {
                                 self.images.clear_failed();
                                 self.images.reset_requests();
                                 self.dl_ui.cache_bytes = store::cache_size();
+                                self.dl_ui.cache_text = store::human_size(self.dl_ui.cache_bytes);
                                 self.toast(self.t("cache-cleared"), ToastTone::Success);
                             }
                             if theme::secondary_button(ui, self.t("open-data-folder")).clicked() {
@@ -5418,6 +5529,9 @@ impl App {
                                 let before = self.persisted.library.len();
                                 self.persisted.library.retain(|entry| !entry.missing());
                                 let removed = before - self.persisted.library.len();
+                                if removed > 0 {
+                                    self.library_rev = self.library_rev.wrapping_add(1);
+                                }
                                 self.dirty = true;
                                 self.toast(
                                     format!(
@@ -5645,7 +5759,7 @@ impl App {
             self.dirty = true;
             self.downloads.configure(
                 self.persisted.settings.max_concurrent,
-                self.persisted.settings.download_dir.clone(),
+                &self.persisted.settings.download_dir,
                 self.persisted.settings.auto_extract,
                 self.persisted.settings.auto_retry,
                 self.persisted.settings.max_retries,
@@ -5769,6 +5883,7 @@ impl App {
                         .any(|existing| existing.album.id == entry.album.id)
                     {
                         self.persisted.library.insert(0, entry.clone());
+                        self.library_rev = self.library_rev.wrapping_add(1);
                     }
                     self.dirty = true;
                     self.toast(
@@ -6308,7 +6423,7 @@ impl eframe::App for App {
         }
         self.downloads.configure(
             self.persisted.settings.max_concurrent,
-            self.persisted.settings.download_dir.clone(),
+            &self.persisted.settings.download_dir,
             self.persisted.settings.auto_extract,
             self.persisted.settings.auto_retry,
             self.persisted.settings.max_retries,
@@ -6418,7 +6533,11 @@ impl eframe::App for App {
             self.last_state_save = Instant::now();
         }
         if self.dl_ui.cache_checked.elapsed() > Duration::from_secs(20) {
-            self.dl_ui.cache_bytes = store::cache_size();
+            let bytes = store::cache_size();
+            if bytes != self.dl_ui.cache_bytes {
+                self.dl_ui.cache_bytes = bytes;
+                self.dl_ui.cache_text = store::human_size(bytes);
+            }
             self.dl_ui.cache_checked = Instant::now();
         }
 
@@ -7103,6 +7222,9 @@ struct CardLayout {
 fn draw_grid(
     ui: &mut Ui,
     albums: &[Album],
+    // Optional index list, used by the watchlist to draw a filtered view
+    // without cloning every album.
+    indices: Option<&[usize]>,
     textures: &mut Textures,
     selected: &HashSet<u64>,
     watchlist: &[Album],
@@ -7113,7 +7235,7 @@ fn draw_grid(
     show_new: bool,
     footer: GridFooter<'_>,
     compact: bool,
-    id_salt: &str,
+    id_salt: impl std::hash::Hash,
     playing_folder: Option<&Path>,
     effects: bool,
     motion: bool,
@@ -7134,7 +7256,9 @@ fn draw_grid(
         card_width,
         card_height,
     };
-    let card_rows = albums.len().div_ceil(columns);
+    let card_rows = indices
+        .map_or(albums.len(), |ids| ids.len())
+        .div_ceil(columns);
     let has_footer = !matches!(footer, GridFooter::None);
     let total_rows = card_rows + usize::from(has_footer);
     let mut actions: Vec<CardAction> = Vec::new();
@@ -7185,10 +7309,14 @@ fn draw_grid(
                 ui.horizontal(|ui| {
                     for column in 0..layout.columns {
                         let index = row * layout.columns + column;
-                        if index >= albums.len() {
+                        let count = indices.map_or(albums.len(), |ids| ids.len());
+                        if index >= count {
                             break;
                         }
-                        let album = &albums[index];
+                        let album = match indices {
+                            Some(ids) => &albums[ids[index]],
+                            None => &albums[index],
+                        };
                         let watched = watch_ids.contains(&album.id);
                         let downloaded = library_ids.contains(&album.id);
                         let playing = playing_ids.contains(&album.id);

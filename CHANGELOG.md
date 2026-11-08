@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this format.
 
 ## [Unreleased]
 
+## [1.3.1] - 2026-11-08
+
+### Changed
+- Library filter, sort and header totals are cached and rebuilt only when the
+  collection or a filter control changes; sorting lowercases each key once
+  (`sort_by_cached_key`) instead of inside the comparator
+- Download settings are compared before being applied, so the per-frame
+  `configure()` no longer reassigns every field or re-dispatches the queue
+- The watchlist grid draws from indices instead of cloning every album each
+  frame, and the folder chip row no longer clones the folder list
+- The download cache size is formatted once and reused by the sidebar and
+  Settings; the cache directory is no longer walked every frame
+- Grid scroll-area IDs use tuple salts instead of allocating `format!` strings
+  every frame
+
 ## [1.3.0] - 2026-11-08
 
 ### Added
