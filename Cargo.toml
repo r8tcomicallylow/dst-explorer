@@ -1,6 +1,6 @@
 [package]
 name = "dst-explorer"
-version = "1.3.2"
+version = "1.3.3"
 edition = "2021"
 description = "A fast, minimal desktop browser and download manager for DoujinStyle.com"
 license = "MIT"
@@ -41,7 +41,12 @@ regex = "1"
 md-5 = "0.10"
 base64 = "0.22"
 crossterm = "0.28"
-rodio = "0.20"
+# Only the output device, `Sink` and mixer are used. Decoding goes through the
+# `SymphoniaSource` in `audio.rs` because rodio's own decoder loses the file
+# length (`ReadSeekSource::byte_len` is always `None`), which broke seeking for
+# FLAC/OGG. Disabling rodio's decoders also keeps claxon/lewton/hound out of
+# the build.
+rodio = { version = "0.20", default-features = false }
 symphonia = { version = "0.5", features = ["all-codecs", "all-formats"] }
 env_logger = "0.11"
 windows = { version = "0.60", features = ["Win32_UI_Shell", "Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_System_Com", "Win32_System_Ole"], optional = true }

@@ -6,22 +6,22 @@
 //! When no output device is available every method degrades to a no-op and the
 //! caller gets a readable error instead of a panic.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
-use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink};
+use rodio::source::SeekError;
+use rodio::{OutputStream, OutputStreamHandle, Sink, Source};
 
 use crate::models::RepeatMode;
 
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::DecoderOptions;
-use symphonia::core::formats::FormatOptions;
+use symphonia::core::formats::{FormatOptions, SeekMode, SeekTo};
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
@@ -108,6 +108,157 @@ pub enum PlaybackState {
 struct AnalyzeResult {
     path: PathBuf,
     waveform: Option<Waveform>,
+}
+
+/// A `rodio::Source` backed directly by Symphonia with a real `File`.
+///
+/// rodio's own `Decoder` wraps the file in a `ReadSeekSource` whose
+/// `byte_len()` is hard-coded to `None`. Symphonia's FLAC demuxer needs the
+/// byte length to binarily search for a frame, so seeking failed with
+/// `SeekError::Unseekable` for FLAC/OGG. Reading through a `File`-backed
+/// `MediaSourceStream` keeps the byte length intact, and implementing
+/// `try_seek` on top of `FormatReader::seek` makes timeline seeking work for
+/// every container Symphonia can demux.
+struct SymphoniaSource {
+    format: Box<dyn symphonia::core::formats::FormatReader>,
+    decoder: Box<dyn symphonia::core::codecs::Decoder>,
+    track_id: u32,
+    sample_rate: u32,
+    channels: u16,
+    total_duration: Option<Duration>,
+    buffer: VecDeque<f32>,
+    finished: bool,
+}
+
+impl SymphoniaSource {
+    fn new(path: &Path) -> Option<Self> {
+        let file = File::open(path).ok()?;
+        let stream = MediaSourceStream::new(Box::new(file), Default::default());
+        let mut hint = Hint::new();
+        if let Some(extension) = path.extension().and_then(|extension| extension.to_str()) {
+            hint.with_extension(extension);
+        }
+        let probed = symphonia::default::get_probe()
+            .format(
+                &hint,
+                stream,
+                &FormatOptions {
+                    enable_gapless: true,
+                    ..Default::default()
+                },
+                &MetadataOptions::default(),
+            )
+            .ok()?;
+        let format = probed.format;
+        let track = format.default_track()?.clone();
+        let decoder = symphonia::default::get_codecs()
+            .make(&track.codec_params, &DecoderOptions::default())
+            .ok()?;
+        let sample_rate = track.codec_params.sample_rate.unwrap_or(44_100).max(1);
+        let channels = track
+            .codec_params
+            .channels
+            .map(|channels| channels.count() as u16)
+            .unwrap_or(2)
+            .max(1);
+        let total_duration = track
+            .codec_params
+            .n_frames
+            .map(|frames| frames as f64 / sample_rate as f64)
+            .map(Duration::from_secs_f64);
+        Some(Self {
+            format,
+            decoder,
+            track_id: track.id,
+            sample_rate,
+            channels,
+            total_duration,
+            buffer: VecDeque::new(),
+            finished: false,
+        })
+    }
+
+    /// Decode packets until at least one interleaved sample is buffered.
+    fn refill(&mut self) {
+        while self.buffer.is_empty() && !self.finished {
+            let packet = match self.format.next_packet() {
+                Ok(packet) => packet,
+                Err(_) => {
+                    self.finished = true;
+                    return;
+                }
+            };
+            if packet.track_id() != self.track_id {
+                continue;
+            }
+            match self.decoder.decode(&packet) {
+                Ok(decoded) => {
+                    let spec = *decoded.spec();
+                    self.sample_rate = spec.rate.max(1);
+                    self.channels = (spec.channels.count() as u16).max(1);
+                    let mut samples = SampleBuffer::<f32>::new(decoded.capacity() as u64, spec);
+                    samples.copy_interleaved_ref(decoded);
+                    self.buffer.extend(samples.samples().iter().copied());
+                }
+                Err(symphonia::core::errors::Error::DecodeError(_)) => continue,
+                Err(_) => {
+                    self.finished = true;
+                    return;
+                }
+            }
+        }
+    }
+}
+
+impl Iterator for SymphoniaSource {
+    type Item = f32;
+
+    fn next(&mut self) -> Option<f32> {
+        if self.buffer.is_empty() {
+            self.refill();
+        }
+        self.buffer.pop_front()
+    }
+}
+
+impl Source for SymphoniaSource {
+    fn current_frame_len(&self) -> Option<usize> {
+        None
+    }
+
+    fn channels(&self) -> u16 {
+        self.channels
+    }
+
+    fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    fn total_duration(&self) -> Option<Duration> {
+        self.total_duration
+    }
+
+    fn try_seek(&mut self, pos: Duration) -> Result<(), SeekError> {
+        let time = symphonia::core::units::Time::new(
+            pos.as_secs(),
+            f64::from(pos.subsec_nanos()) / 1_000_000_000.0,
+        );
+        self.format
+            .seek(
+                SeekMode::Accurate,
+                SeekTo::Time {
+                    time,
+                    track_id: Some(self.track_id),
+                },
+            )
+            .map_err(|_| SeekError::NotSupported {
+                underlying_source: std::any::type_name::<Self>(),
+            })?;
+        self.decoder.reset();
+        self.buffer.clear();
+        self.finished = false;
+        Ok(())
+    }
 }
 
 pub struct AudioPlayer {
@@ -449,7 +600,14 @@ impl AudioPlayer {
     }
 
     pub fn seek(&mut self, seconds: f32) -> Result<(), String> {
-        let target = seconds.max(0.0);
+        let mut target = seconds.max(0.0);
+        // Seeking to the exact end has no packet to land on, so keep the
+        // target just inside the track. This also stops Ctrl+Right from
+        // pushing the playhead past the last frame.
+        let duration = self.duration();
+        if duration > 0.0 {
+            target = target.min((duration - 0.05).max(0.0));
+        }
         if self.sink.is_none() {
             self.resume_at = target;
             return Ok(());
@@ -667,9 +825,8 @@ fn seed_rng() -> u64 {
     nanos | 1
 }
 
-fn open_decoder(path: &Path) -> Option<Decoder<BufReader<File>>> {
-    let file = File::open(path).ok()?;
-    Decoder::new(BufReader::new(file)).ok()
+fn open_decoder(path: &Path) -> Option<SymphoniaSource> {
+    SymphoniaSource::new(path)
 }
 
 fn track_title(path: &Path) -> String {
@@ -862,6 +1019,90 @@ mod tests {
         drop(sink);
         let _ = std::fs::remove_file(first);
         let _ = std::fs::remove_file(second);
+    }
+
+    #[test]
+    fn decoder_supports_seeking() {
+        // The player seeks through `Sink::try_seek`, so the custom source must
+        // forward `try_seek` to Symphonia's format reader.
+        use rodio::Source;
+
+        let path = std::env::temp_dir().join("dst-explorer-audio-seek.wav");
+        write_test_wav(&path);
+
+        let mut decoder = open_decoder(&path).expect("wav should decode");
+        for _ in 0..4_000 {
+            let _ = decoder.next();
+        }
+        decoder
+            .try_seek(Duration::from_secs_f32(1.5))
+            .expect("decoder should support seeking");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sink_seek_moves_the_playhead() {
+        // Exercise the real playback path: `AudioPlayer::seek` goes through
+        // `Sink::try_seek`, which only completes while samples are being
+        // consumed, so drain the idle output on a background thread.
+        let path = std::env::temp_dir().join("dst-explorer-audio-sink-seek.wav");
+        write_test_wav(&path);
+
+        let (sink, mut output) = rodio::Sink::new_idle();
+        sink.append(open_decoder(&path).expect("wav should decode"));
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        let consumer = thread::spawn(move || {
+            let mut samples = 0u32;
+            loop {
+                if stop_rx.try_recv().is_ok() {
+                    break;
+                }
+                if output.next().is_none() {
+                    break;
+                }
+                samples += 1;
+                // 8 kHz test file: pace at roughly real time.
+                if samples % 8 == 0 {
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }
+        });
+
+        thread::sleep(Duration::from_millis(150));
+        let before = sink.get_pos().as_secs_f32();
+        assert!(before < 1.0, "unexpected initial position {before}");
+
+        sink.try_seek(Duration::from_secs_f32(1.5))
+            .expect("sink seek should succeed");
+        thread::sleep(Duration::from_millis(150));
+        let after = sink.get_pos().as_secs_f32();
+        assert!(
+            (1.4..1.9).contains(&after),
+            "seek should move the playhead near 1.5s, got {after}"
+        );
+
+        let _ = stop_tx.send(());
+        let _ = consumer.join();
+        drop(sink);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn flac_decoder_supports_seeking() {
+        // Regression test for rodio's `ReadSeekSource::byte_len() == None`,
+        // which made Symphonia's FLAC demuxer report `Unseekable`. The player
+        // now decodes through its own `File`-backed source.
+        use rodio::Source;
+
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/test/seek.flac");
+        let mut decoder = open_decoder(&path).expect("flac should decode");
+        for _ in 0..4_000 {
+            let _ = decoder.next();
+        }
+        decoder
+            .try_seek(Duration::from_secs_f32(1.5))
+            .expect("flac decoder should support seeking");
     }
 
     fn write_test_wav(path: &Path) {
