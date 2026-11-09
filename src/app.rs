@@ -571,6 +571,8 @@ pub struct App {
     toasts: Vec<Toast>,
     preview_cover: bool,
     focus_search: bool,
+    /// Whether the search filter rows (kind, format, history, sort, filter) are visible.
+    search_filters_open: bool,
     search_save_draft: Option<String>,
     library_query: String,
     library_format_filter: Option<String>,
@@ -707,6 +709,7 @@ impl App {
             toasts: Vec::new(),
             preview_cover: false,
             focus_search: false,
+            search_filters_open: true,
             search_save_draft: None,
             library_query: String::new(),
             library_format_filter: None,
@@ -3219,12 +3222,14 @@ impl App {
             .inner_margin(Margin::same(16.0))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    let button_width = if ui.available_width() < 300.0 {
-                        84.0
-                    } else {
-                        104.0
-                    };
-                    let field_width = (ui.available_width() - button_width - 10.0).max(80.0);
+                    let available = ui.available_width();
+                    let narrow = available < 520.0;
+                    let button_width = if available < 300.0 { 84.0 } else { 104.0 };
+                    let toggle_width = if narrow { 64.0 } else { 108.0 };
+                    // The search field's frame adds an icon, inner margins and
+                    // item spacing, so reserve that chrome as well; otherwise
+                    // the Search button is pushed past the right edge.
+                    let field_width = (available - button_width - toggle_width - 26.0).max(80.0);
                     let response = draw_search_field(ui, &mut self.search.query, field_width);
                     if response.lost_focus()
                         && ui.input(|input| input.key_pressed(egui::Key::Enter))
@@ -3248,42 +3253,74 @@ impl App {
                     {
                         run_search = true;
                     }
-                });
-                ui.add_space(11.0);
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(
-                        egui::RichText::new("SEARCH BY")
-                            .size(9.5)
-                            .strong()
-                            .color(DIM()),
-                    );
-                    ui.add_space(2.0);
-                    for kind in SearchKind::ALL {
-                        if theme::chip(ui, kind.label(), self.search.kind == kind).clicked() {
-                            self.search.kind = kind;
+                    let toggle_text = if self.search_filters_open {
+                        if narrow {
+                            "Hide"
+                        } else {
+                            "Hide filters"
                         }
-                    }
-                    ui.add_space(18.0);
-                    ui.label(
-                        egui::RichText::new("FORMAT")
-                            .size(9.5)
-                            .strong()
-                            .color(DIM()),
-                    );
-                    ui.add_space(2.0);
-                    let options = [
-                        ("FLAC", self.search.formats.flac),
-                        ("MP3", self.search.formats.mp3),
-                        ("TTA", self.search.formats.tta),
-                        ("Opus", self.search.formats.opus),
-                        ("OGG", self.search.formats.ogg),
-                    ];
-                    for (label, active) in options {
-                        if theme::chip(ui, label, active).clicked() {
-                            toggle_format(&mut self.search.formats, label);
-                        }
+                    } else if narrow {
+                        "Show"
+                    } else {
+                        "Show filters"
+                    };
+                    if ui
+                        .add_sized(
+                            [toggle_width, 38.0],
+                            egui::Button::new(
+                                egui::RichText::new(toggle_text).size(12.0).color(MUTED()),
+                            )
+                            .fill(CARD())
+                            .stroke(Stroke::new(1.0_f32, BORDER_SOFT()))
+                            .rounding(Rounding::same(9.0)),
+                        )
+                        .on_hover_text(if self.search_filters_open {
+                            "Collapse search filters"
+                        } else {
+                            "Show search filters"
+                        })
+                        .clicked()
+                    {
+                        self.search_filters_open = !self.search_filters_open;
                     }
                 });
+                if self.search_filters_open {
+                    ui.add_space(11.0);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            egui::RichText::new("SEARCH BY")
+                                .size(9.5)
+                                .strong()
+                                .color(DIM()),
+                        );
+                        ui.add_space(2.0);
+                        for kind in SearchKind::ALL {
+                            if theme::chip(ui, kind.label(), self.search.kind == kind).clicked() {
+                                self.search.kind = kind;
+                            }
+                        }
+                        ui.add_space(18.0);
+                        ui.label(
+                            egui::RichText::new("FORMAT")
+                                .size(9.5)
+                                .strong()
+                                .color(DIM()),
+                        );
+                        ui.add_space(2.0);
+                        let options = [
+                            ("FLAC", self.search.formats.flac),
+                            ("MP3", self.search.formats.mp3),
+                            ("TTA", self.search.formats.tta),
+                            ("Opus", self.search.formats.opus),
+                            ("OGG", self.search.formats.ogg),
+                        ];
+                        for (label, active) in options {
+                            if theme::chip(ui, label, active).clicked() {
+                                toggle_format(&mut self.search.formats, label);
+                            }
+                        }
+                    });
+                }
             });
         ui.add_space(12.0);
 
@@ -3310,7 +3347,9 @@ impl App {
         let mut cancel_save = false;
         let mut new_sort: Option<SearchSort> = None;
 
-        if !history.is_empty() || !saved.is_empty() || !query.is_empty() {
+        if self.search_filters_open
+            && (!history.is_empty() || !saved.is_empty() || !query.is_empty())
+        {
             Frame::none()
                 .fill(CARD())
                 .stroke(Stroke::new(1.0_f32, BORDER_SOFT()))
@@ -3410,44 +3449,46 @@ impl App {
             }
         }
 
-        if let Some(draft) = self.search_save_draft.as_mut() {
-            Frame::none()
-                .fill(PANEL())
-                .stroke(Stroke::new(1.0_f32, accent_dim(70)))
-                .rounding(Rounding::same(11.0))
-                .inner_margin(Margin::symmetric(12.0, 9.0))
-                .show(ui, |ui| {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(
-                            egui::RichText::new("SAVE AS")
-                                .size(9.5)
-                                .strong()
-                                .color(DIM()),
-                        );
-                        let width = (ui.available_width() - 150.0).clamp(100.0, 360.0);
-                        let response = ui.add_sized(
-                            [width, 30.0],
-                            TextEdit::singleline(draft)
-                                .hint_text("Name this search")
-                                .margin(Margin::symmetric(9.0, 6.0)),
-                        );
-                        if response.lost_focus()
-                            && ui.input(|input| input.key_pressed(egui::Key::Enter))
-                        {
-                            commit_save = true;
-                        }
-                        if theme::primary_button_w(ui, "Save", 64.0).clicked() {
-                            commit_save = true;
-                        }
-                        if theme::icon_button(ui, Icon::Close, 22.0, DIM())
-                            .on_hover_text("Cancel")
-                            .clicked()
-                        {
-                            cancel_save = true;
-                        }
+        if self.search_filters_open {
+            if let Some(draft) = self.search_save_draft.as_mut() {
+                Frame::none()
+                    .fill(PANEL())
+                    .stroke(Stroke::new(1.0_f32, accent_dim(70)))
+                    .rounding(Rounding::same(11.0))
+                    .inner_margin(Margin::symmetric(12.0, 9.0))
+                    .show(ui, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(
+                                egui::RichText::new("SAVE AS")
+                                    .size(9.5)
+                                    .strong()
+                                    .color(DIM()),
+                            );
+                            let width = (ui.available_width() - 150.0).clamp(100.0, 360.0);
+                            let response = ui.add_sized(
+                                [width, 30.0],
+                                TextEdit::singleline(draft)
+                                    .hint_text("Name this search")
+                                    .margin(Margin::symmetric(9.0, 6.0)),
+                            );
+                            if response.lost_focus()
+                                && ui.input(|input| input.key_pressed(egui::Key::Enter))
+                            {
+                                commit_save = true;
+                            }
+                            if theme::primary_button_w(ui, "Save", 64.0).clicked() {
+                                commit_save = true;
+                            }
+                            if theme::icon_button(ui, Icon::Close, 22.0, DIM())
+                                .on_hover_text("Cancel")
+                                .clicked()
+                            {
+                                cancel_save = true;
+                            }
+                        });
                     });
-                });
-            ui.add_space(4.0);
+                ui.add_space(4.0);
+            }
         }
         if commit_save {
             if let Some(draft) = self.search_save_draft.take() {
@@ -3471,7 +3512,7 @@ impl App {
             self.run_search(text, kind, formats);
         }
 
-        if self.search.searched {
+        if self.search.searched && self.search_filters_open {
             ui.add_space(2.0);
             ui.horizontal_wrapped(|ui| {
                 ui.label(egui::RichText::new("SORT").size(9.5).strong().color(DIM()));
@@ -3493,7 +3534,7 @@ impl App {
             }
         }
 
-        if self.search.searched {
+        if self.search.searched && self.search_filters_open {
             let mut filters_changed = false;
             ui.horizontal_wrapped(|ui| {
                 ui.label(
@@ -6804,8 +6845,12 @@ fn draw_search_field(ui: &mut Ui, query: &mut String, width: f32) -> Response {
             ui.horizontal_centered(|ui| {
                 let (rect, _) = ui.allocate_exact_size(vec2(17.0, 17.0), Sense::hover());
                 theme::paint_icon(ui.painter(), rect, Icon::Search, DIM(), 1.5);
+                // `width` is the total space this widget may occupy: subtract
+                // the icon (17), the 10 px item spacing and this frame's
+                // inner margins (11 + 8).
+                let text_width = (width - 46.0).max(40.0);
                 let response = ui.add_sized(
-                    [width, 26.0],
+                    [text_width, 26.0],
                     TextEdit::singleline(query)
                         .id(search_field_id())
                         .frame(false)

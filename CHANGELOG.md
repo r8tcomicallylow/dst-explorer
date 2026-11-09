@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this format.
 
 ## [Unreleased]
 
+## [1.3.4] - 2026-11-09
+
+### Added
+- Search filters can be collapsed with the new "Hide filters" / "Show filters"
+  button, giving the album grid more vertical space
+
+### Fixed
+- The Search button no longer overflows the right edge; the field width now
+  accounts for its icon, inner margins and item spacing
+
 ## [1.3.3] - 2026-11-09
 
 ### Fixed
