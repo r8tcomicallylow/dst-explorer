@@ -645,6 +645,11 @@ impl App {
 
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         theme::install_fonts(&cc.egui_ctx);
+        // The app owns the zoom factor (it mirrors the Settings slider and is
+        // applied every frame), so egui must not fight it with its own
+        // Ctrl+Plus/Minus handler.
+        cc.egui_ctx
+            .options_mut(|options| options.zoom_with_keyboard = false);
         store::ensure_dirs();
         let persisted = store::load_state();
         theme::configure(
@@ -1353,6 +1358,9 @@ impl App {
             volume_up,
             volume_down,
             toggle_light,
+            zoom_in,
+            zoom_out,
+            zoom_reset,
         ) = ctx.input(|input| {
             (
                 (input.modifiers.command && input.key_pressed(egui::Key::F))
@@ -1391,6 +1399,13 @@ impl App {
                 input.modifiers.command && input.key_pressed(egui::Key::ArrowUp),
                 input.modifiers.command && input.key_pressed(egui::Key::ArrowDown),
                 input.modifiers.alt && input.modifiers.command && input.key_pressed(egui::Key::L),
+                // Ctrl+Shift+= (plus), Ctrl+Shift+- and Ctrl+0. Bare Ctrl+Plus
+                // and Ctrl+Minus work too, matching the usual zoom shortcuts.
+                input.modifiers.command
+                    && (input.key_pressed(egui::Key::Plus)
+                        || (input.modifiers.shift && input.key_pressed(egui::Key::Equals))),
+                input.modifiers.command && input.key_pressed(egui::Key::Minus),
+                input.modifiers.command && input.key_pressed(egui::Key::Num0),
             )
         });
 
@@ -1515,6 +1530,25 @@ impl App {
             self.persisted.settings.audio_volume = volume;
             self.player.set_volume(volume);
             self.dirty = true;
+        }
+        if zoom_in || zoom_out || zoom_reset {
+            let step = if zoom_in {
+                0.05
+            } else if zoom_out {
+                -0.05
+            } else {
+                0.0
+            };
+            let current = self.persisted.settings.ui_scale;
+            let target = if zoom_reset { 1.0 } else { current + step };
+            // Snap to the same 5% grid as the Settings slider and keep it in
+            // sync with it; the per-frame `set_zoom_factor` applies the value.
+            let scale = ((target.clamp(0.75, 1.75) * 100.0).round() / 100.0).clamp(0.75, 1.75);
+            if (scale - current).abs() > f32::EPSILON {
+                self.persisted.settings.ui_scale = scale;
+                ctx.set_zoom_factor(scale);
+                self.dirty = true;
+            }
         }
         if shortcuts_help {
             self.show_shortcuts = !self.show_shortcuts;
@@ -5595,7 +5629,7 @@ impl App {
                     ui.add_space(6.0);
                     ui.label(
                         egui::RichText::new(
-                            "Space: play/pause | Ctrl+Left/Right: previous/next | Ctrl+Shift+Left/Right: seek 10 s | Ctrl+Up/Down: volume",
+                            "Space: play/pause | Ctrl+Left/Right: previous/next | Ctrl+Shift+Left/Right: seek 10 s | Ctrl+Up/Down: volume | Ctrl+Shift+=/-: UI scale",
                         )
                         .size(10.5)
                         .color(DIM()),
@@ -6329,6 +6363,8 @@ impl App {
                 shortcut_row(ui, "Ctrl+Left / Ctrl+Right", "Previous / next track");
                 shortcut_row(ui, "Ctrl+Shift+Left / Right", "Seek 10 seconds");
                 shortcut_row(ui, "Ctrl+Up / Ctrl+Down", "Player volume");
+                shortcut_row(ui, "Ctrl+Shift+= / Ctrl+Shift+-", "Zoom UI in / out");
+                shortcut_row(ui, "Ctrl+0", "Reset UI scale");
                 shortcut_row(ui, "Ctrl+Alt+L", "Toggle light / dark theme");
                 shortcut_row(ui, "Ctrl+Alt+T", "Cycle accent colour");
 
