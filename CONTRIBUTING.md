@@ -6,7 +6,7 @@ Thank you for considering contributing! This is a personal project, but contribu
 
 ```bash
 # Clone and build
-git clone https://github.com/yourusername/dst-explorer
+git clone https://github.com/r8tcomicallylow/dst-explorer
 cd dst-explorer
 cargo run
 ```
