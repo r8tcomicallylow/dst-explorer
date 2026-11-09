@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this format.
 
 ## [Unreleased]
 
+## [1.3.3] - 2026-11-09
+
+### Fixed
+- Seeking in FLAC/OGG (and every other Symphonia format) now works. rodio's
+  decoder wrapper reports no byte length, which made Symphonia's FLAC demuxer
+  refuse to seek; the player now decodes through its own `File`-backed
+  `SymphoniaSource` with a real `try_seek`
+- Clicking or dragging the waveform moves the playhead; seeks to the very end
+  now land just inside the track instead of failing
+- `Ctrl+Shift+=`, `Ctrl+Shift+-` and `Ctrl+0` change the UI scale again; egui's
+  built-in zoom handler is disabled so it cannot fight the Settings slider
+
 ## [1.3.2] - 2026-11-08
 
 ### Fixed
